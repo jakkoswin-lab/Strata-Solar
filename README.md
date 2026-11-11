@@ -29,6 +29,30 @@
 > its engine path (`src/glm4`), the tokenizer and chat-template support in `serve`, and a setup/model-menu entry.
 > Measurements, limits and the port's own log: [docs/SOLAR_PORT.md](docs/SOLAR_PORT.md).
 
+### Install this fork (source)
+
+There is no ready-made engine package for this fork yet, and the upstream release binaries do not include the
+`glm4moe` path, so setup compiles the engine once (`--build`). What that needs:
+
+- an NVIDIA card (sm_75 or newer; measured on a 16 GB RTX 5060 Ti), 48 GB of RAM, ~40 GB of disk for the model,
+  and the file on an NVMe (a 5.7 MiB random read took 44.6 ms on a 5400 rpm disk)
+- the CUDA 13.x toolkit and Visual Studio 2022 Build Tools; the first build takes 10-20 minutes
+
+```sh
+git clone https://github.com/jakkoswin-lab/Strata-Solar
+cd Strata-Solar
+python setup.py --family solar --build
+```
+
+With a model file already on disk:
+
+```sh
+python setup.py --family solar --gguf-dir <folder with Solar-Open-100B.i1-IQ3_XXS.gguf> --build
+```
+
+Without `--build` setup downloads the upstream prebuilt engine and stops with "this engine does not run
+Solar-Open-100B yet". After the first build only the changed sources are compiled again.
+
 ## Models
 
 We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where a compatible model fits.
