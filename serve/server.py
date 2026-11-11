@@ -5008,6 +5008,7 @@ class Service:
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = end_token_ids(tokenizer)
+        self.skip_ids = set()                         # family markers that must never reach the text (Solar's <|content|>)
         self.family = None                              # the model family ("deepseek41"): set_family() below
         self.parser_cls = parser_for_template(getattr(template, "source", None))   # reads the model's output (reasoning, content, tool calls): by the template's tool-call form
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
@@ -5024,7 +5025,8 @@ class Service:
 
     def set_family(self, family: str | None) -> None:
         """A family whose text differs from the Qwen form this server was written for (DeepSeek-V4.1: its own end
-        token, DSML tool calls, reasoning-effort words).  The others keep the defaults."""
+        token, DSML tool calls, reasoning-effort words; Solar-Open-100B: its own message markers).  The others keep
+        the defaults."""
         self.family = family
         if family == "deepseek41":
             from serve import dsml
@@ -5032,6 +5034,15 @@ class Service:
             self.stop_ids = {int(eos)}
             self.parser_cls = dsml.DsmlOutputParser
             self._force_text = dsml.to_dsml_force
+        elif family == "glm4moe":
+            # Solar-Open-100B names its own boundaries.  A reply opens with <|content|>, which the model writes itself,
+            # and a turn that ends without <|end|> (measured with a one-line prompt: <|flush|><|begin|><role>...) has
+            # to end at the next message boundary too.  The markers are dropped from the text: a control token's bytes
+            # are its literal spelling, so <|content|> used to print in front of every answer.
+            ids = getattr(self.tok, "ids", None) or {}
+            eos = (getattr(self.tok, "special_ids", None) or {}).get("tokenizer.ggml.eos_token_id", 2)
+            self.skip_ids = {int(ids[n]) for n in ("<|content|>", "<|flush|>", "<|think|>") if n in ids}
+            self.stop_ids = {int(eos)} | {int(ids[n]) for n in ("<|end|>", "<|begin|>") if n in ids}
         import serve.frontend as _frontend
         _frontend.use_family(family)
 
@@ -6557,6 +6568,8 @@ class Service:
                                     finish = "stop"
                                     raw_ids.append(t)
                                     break
+                                if t in self.skip_ids:
+                                    continue            # a family marker (Solar's <|content|>): a boundary, not text
                                 raw_ids.append(t)
                                 seg.append(t)
                                 thinking_n += parser.state in ("reasoning", "rcall")
@@ -9405,8 +9418,8 @@ def clean_shared_defaults(d) -> dict:
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "reasoning_effort":
-            if value not in ("none", "low", "medium", "high"):
-                raise ValueError("reasoning_effort: none, low, medium or high")
+            if value not in ("none", "low", "minimal", "medium", "high"):
+                raise ValueError("reasoning_effort: none, low, minimal, medium or high")
         elif key == "temperature":
             if not number or not 0 <= value <= 2:
                 raise ValueError("temperature: 0..2")
@@ -9824,6 +9837,8 @@ def arch_from_tokenizer(arch, pre) -> str | None:
     and no DSML tool calls.  The pack's tokenizer says what it is (its pre-tokenizer is "deepseek3"); an arch the config names is never changed."""
     if arch:
         return arch
+    if str(pre or "") == "solar-open":              # Solar-Open-100B (glm4moe): its own boundaries, minimal effort
+        return "glm4moe"
     return "deepseek41" if str(pre or "").startswith("deepseek") else None
 
 
@@ -10397,7 +10412,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family(svc.model_arch if svc.model_arch == "deepseek41" else None)
+        svc.set_family(svc.model_arch if svc.model_arch in ("deepseek41", "glm4moe") else None)
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])

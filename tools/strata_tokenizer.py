@@ -103,9 +103,13 @@ class UnknownPreTokenizer(ValueError):
 
 def pre_tokenizer_kind(pre) -> str | None:
     """The splitting rule `pre` (the GGUF's tokenizer.ggml.pre, or a pack's tokenizer.json "pre") stands for: "qwen35", "deepseek3", or
-    None for a type this file does not know.  An empty or missing value is the qwen35 default, as it always was."""
+    None for a type this file does not know.  An empty or missing value is the qwen35 default, as it always was.
+
+    Solar-Open-100B calls its rule `solar-open`, and llama.cpp gives that case the QWEN35 pattern character for
+    character (`LLAMA_VOCAB_PRE_TYPE_SOLAR_OPEN`, src/llama-vocab.cpp L393, next to the QWEN35 case at L396).  It is
+    therefore one rule here too - transcribed once, not a second time from the Solar tokenizer.json."""
     p = "qwen35" if pre is None or pre == "" else str(pre)
-    if p == "qwen35":
+    if p in ("qwen35", "solar-open"):
         return "qwen35"
     if p.startswith("deepseek"):
         return "deepseek3"
@@ -499,7 +503,9 @@ def extract(gguf_path, out_dir) -> dict:
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
         "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        "pre_pattern_source": (".ref/llama.cpp src/llama-vocab.cpp L393 (LLAMA_VOCAB_PRE_TYPE_SOLAR_OPEN, the QWEN35 "
+                               "pattern verbatim)" if tk.pre == "solar-open" else
+                               ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in

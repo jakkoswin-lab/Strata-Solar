@@ -403,6 +403,8 @@ class PreTokenizerType(unittest.TestCase):
         self.assertEqual(ST.pre_tokenizer_kind("qwen35"), "qwen35")
         self.assertEqual(ST.pre_tokenizer_kind(None), "qwen35")
         self.assertEqual(ST.pre_tokenizer_kind(""), "qwen35")
+        # Solar-Open-100B: llama.cpp gives LLAMA_VOCAB_PRE_TYPE_SOLAR_OPEN the QWEN35 pattern verbatim (L393/L396)
+        self.assertEqual(ST.pre_tokenizer_kind("solar-open"), "qwen35")
         for p in ("deepseek3", "deepseek-v3", "deepseek-llm", "deepseek41"):
             self.assertEqual(ST.pre_tokenizer_kind(p), "deepseek3", p)
 

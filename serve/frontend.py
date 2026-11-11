@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -50,6 +51,9 @@ class ChatTemplate:
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
+        # llama.cpp's own global, which a template that prints a date in its system prompt calls (Solar-Open-100B's
+        # does).  Without it that template fails on every request with "'strftime_now' is undefined".
+        env.globals["strftime_now"] = lambda fmt="%Y-%m-%d": time.strftime(fmt)
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
         self.caps = self._detect_caps()
@@ -139,16 +143,29 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
 # Effort: N" line of its prompt).  use_family("deepseek41") switches the table; the other families keep the one above.
 EFFORT_DEEPSEEK = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
                    "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
+# Solar-Open-100B's template reads "low", "minimal" and its default "high" (its generation prompt renders the empty
+# think block for low and minimal; there is no "off"), so the words pass through as they are and a client's "none"
+# becomes the same minimal block.  Its default is set by the config ("reasoning_effort": "minimal"), not here.
+EFFORT_SOLAR = {"none": "minimal", "off": "minimal", "minimal": "minimal", "disabled": "minimal", "false": "minimal",
+                "low": "low", "medium": "medium", "high": "high", "xhigh": "high", "max": "high", "maximum": "high"}
 _EFFORT_QWEN = dict(EFFORT)
+_EFFORT_TABLES = {"deepseek41": EFFORT_DEEPSEEK, "glm4moe": EFFORT_SOLAR}
 _NUMERIC_EFFORT = False
+# Solar-Open-100B's template renders an empty think block for these, and the model then writes its answer directly:
+# the reply parser has to start in content, or the whole answer is reported as reasoning_content (measured: a
+# translation landed in `reasoning_content` with `content: ""`).  `enable_thinking` is not read by that template; it
+# is the server's own "the reply starts with the answer" flag.
+_SOLAR = False
+_SOLAR_CONTENT = ("minimal", "low")
 
 
 def use_family(family: str | None) -> None:
     """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER)."""
-    global _NUMERIC_EFFORT
+    global _NUMERIC_EFFORT, _SOLAR
     EFFORT.clear()
-    EFFORT.update(EFFORT_DEEPSEEK if family == "deepseek41" else _EFFORT_QWEN)
+    EFFORT.update(_EFFORT_TABLES.get(family, _EFFORT_QWEN))
     _NUMERIC_EFFORT = family == "deepseek41"
+    _SOLAR = family == "glm4moe"
 
 
 def effort_kwargs(value) -> dict:
@@ -166,7 +183,12 @@ def effort_kwargs(value) -> dict:
         raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high"
                          + (", max or 1..100" if _NUMERIC_EFFORT else ""))
     level = EFFORT[key]
-    return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
+    if level is None:
+        return {"enable_thinking": False}
+    out = {"reasoning_effort": level}
+    if _SOLAR and level in _SOLAR_CONTENT:
+        out["enable_thinking"] = False               # the reply starts with the answer (see _SOLAR_CONTENT)
+    return out
 
 
 def budget_effort(tokens) -> dict:
