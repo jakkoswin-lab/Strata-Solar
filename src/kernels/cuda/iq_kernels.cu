@@ -1,4 +1,4 @@
-// src/kernels/cuda/iq_kernels.cu - see include/strata/kernels/iq_kernels.hpp.
+﻿// src/kernels/cuda/iq_kernels.cu - see include/strata/kernels/iq_kernels.hpp.
 //
 // The dot products (vec_dot_*_q8_1), the dequantizers and the q8_1 quantizer are transcribed from llama.cpp
 // (ggml/src/ggml-cuda/vecdotq.cuh, dequantize.cuh, quantize.cu at the commit in third_party/ggml/VERSION.txt;
@@ -812,6 +812,48 @@ template<> struct Fmt<29> { static constexpr int qk = 256, ipb = 8, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq1_m_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<42> { static constexpr int qk = 64, ipb = 2, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_0_q8_1(v, y, kbx, iqs); } };
+// Q2_K (ggml type 10): llama.cpp's vec_dot_q2_K_q8_1 (vecdotq.cuh, VDR 1), transcribed like the Q4_K / Q5_K ones.
+// mradermacher's IQ2 quants keep the token embedding and a few down projections at Q2_K.
+constexpr int VDR_Q2_K = 1;
+
+__device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq(const int& v, const int* __restrict__ u,
+                                                             const uint8_t* __restrict__ scales, const half2& dm2,
+                                                             const float* __restrict__ d8) {
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR2_K; ++i) {
+        const int sc = scales[2 * i];
+        const int vi = (v >> (2 * i)) & 0x03030303;
+        sumf_d += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * (sc & 0xF));
+        int m = sc >> 4;
+        m |= m << 8;
+        m |= m << 16;
+        sumf_m += d8[i] * ggml_cuda_dp4a(m, u[i], 0);
+    }
+    const float2 dm2f = __half22float2(dm2);
+    return dm2f.x * sumf_d - dm2f.y * sumf_m;
+}
+
+__device__ __forceinline__ float vec_dot_q2_K_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                   const int& kbx, const int& iqs) {
+    const block_q2_K* bq2_K = (const block_q2_K*) vbq + kbx;
+    const int bq8_offset = QR2_K * (iqs / QI8_1);
+    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1 / 2);
+    const uint8_t* scales = bq2_K->scales + scale_offset;
+    const int v = get_int_b4(bq2_K->qs, iqs);
+    int u[QR2_K];
+    float d8[QR2_K];
+#pragma unroll
+    for (int i = 0; i < QR2_K; ++i) {
+        u[i] = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+        d8[i] = __low2float(bq8_1[bq8_offset + i].ds);
+    }
+    return vec_dot_q2_K_q8_1_impl_mmvq(v, u, scales, bq2_K->dm, d8);
+}
+
+template<> struct Fmt<10> { static constexpr int qk = 256, ipb = QI2_K / VDR_Q2_K, step = VDR_Q2_K;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<12> { static constexpr int qk = 256, ipb = QI4_K / VDR_Q4_K, step = VDR_Q4_K;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q4_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<13> { static constexpr int qk = 256, ipb = QI5_K / VDR_Q5_K, step = VDR_Q5_K;
@@ -856,7 +898,7 @@ STRATA_TQP_FMT(149)
 #else
 #define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(40) X(144) X(146) X(147) X(148) X(149)
 #endif
-#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(146) X(147) X(148) X(149)
+#define STRATA_MMVQ_FMTS(X) X(10) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(146) X(147) X(148) X(149)
 template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;     // NVFP4: 2 calls of 32 values
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_nvfp4_q8_1(v, y, kbx, iqs); } };
 
@@ -889,6 +931,23 @@ __global__ void __launch_bounds__(128) mmvq_kernel(const uint8_t* __restrict__ w
     const uint8_t* wr = w + (size_t) row * row_bytes;
     for (int c = 0; c < ncols; ++c) {
         const float s = row_dot<TY>(wr, x + (size_t) c * (n_in / 32), nb, lane);
+        if (lane == 0) y[(size_t) c * n_out + row] = s;
+    }
+}
+
+/// One weight matrix per column (the indirect expert path): column c reads `wptrs[c]`, activation column `xcol[c]`.
+/// The plain per-column dot, so every format mmvq_kernel takes is supported; the launch count is the point.
+template<int TY, int RPB>
+__global__ void __launch_bounds__(32 * RPB) mmvq_ptrs_kernel(const uint8_t* const* __restrict__ wp, size_t row_bytes,
+                                                        const block_q8_1* __restrict__ x, float* __restrict__ y,
+                                                        int n_in, int n_out, int ncols, const int* __restrict__ xcol) {
+    const int row = blockIdx.x * RPB + threadIdx.y;
+    if (row >= n_out) return;
+    const int lane = threadIdx.x;
+    const int nb = n_in / Fmt<TY>::qk, xb = n_in / 32;
+    for (int c = 0; c < ncols; ++c) {
+        const uint8_t* wr = wp[c] + (size_t) row * row_bytes;
+        const float s = row_dot<TY>(wr, x + (size_t) xcol[c] * xb, nb, lane);
         if (lane == 0) y[(size_t) c * n_out + row] = s;
     }
 }
@@ -3046,6 +3105,24 @@ __device__ void dq_iq4_nl(const void* vx, int64_t ibs, dst_t* yy, int tid) {
         y[j + 16] = cvt<dst_t>(d * kvalues_iq4nl[q4[j] >> 4]);
     }
 }
+// Q2_K (ggml type 10): llama.cpp's dequantize_row_q2_K, 8 values per thread.  One 256-value super-block is 16
+// scale/min bytes, 64 two-bit quads and the fp16 d / dmin pair; the scales run as 2 blocks of 128 values, each 4
+// groups of 32 (two 16-value halves sharing a scale byte) with the quad bits taken at shift 0, 2, 4, 6.
+template<typename dst_t>
+__device__ void dq_q2_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_q2_K* x = (const block_q2_K*) vx + ibs;
+    const float2 dm = __half22float2(x->dm);
+    const float d = dm.x, mn = dm.y;
+    const int i = tid * 8;
+    const int n = i / 128, r = i % 128;
+    const int j = r / 32, half = (r % 32) / 16, off = r % 16;
+    const uint8_t sc = x->scales[8 * n + 2 * j + half];
+    const float dl = d * (float) (sc & 0xF);
+    const float ml = mn * (float) (sc >> 4);
+    const uint8_t* q = x->qs + 32 * n + 16 * half + off;
+    const int shift = 2 * j;
+    for (int l = 0; l < 8; ++l) yy[i + l] = cvt<dst_t>(dl * (float) ((q[l] >> shift) & 3) - ml);
+}
 // Q3_K (the Q2_0 file's token_embd): llama.cpp's dequantize_block_q3_K, its 64 threads folded onto 32
 template<typename dst_t>
 __device__ void dq_q3_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -3322,6 +3399,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 22: dq_iq2_s(vx, ibs, y, tid); break;
         case 29: dq_iq1_m(vx, ibs, y, tid); break;
         case 23: dq_iq4_xs(vx, ibs, y, tid); break;
+        case 10: dq_q2_k(vx, ibs, y, tid); break;
         case 11: dq_q3_k(vx, ibs, y, tid); break;
         case 42: dq_q2_0(vx, ibs, y, tid); break;
         case 12: dq_q4_k(vx, ibs, y, tid); break;
@@ -3379,7 +3457,7 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
-    return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
+    return t == 10 || t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
 #ifdef STRATA_Q6K_EXPERTS
            t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8 || t == 40 || t == 144 || t == 145 || t == 146 || t == 147 || t == 148 || t == 149;
 #else
@@ -5338,6 +5416,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
+        case 10: return (size_t) (n / 256) * sizeof(block_q2_K);
         case 12: return (size_t) (n / 256) * sizeof(block_q4_K);
         case 13: return (size_t) (n / 256) * sizeof(block_q5_K);
         case 14: return (size_t) (n / 256) * sizeof(block_q6_K);
@@ -5394,6 +5473,29 @@ __global__ void embed_rows_kernel(int ty, const uint8_t* __restrict__ table, siz
     dq_dispatch<float>(ty, row, b, y + (size_t) t * n_embd + b * QK_K, threadIdx.x);
 }
 }  // namespace
+
+void iq_mmvq_ptrs(int t, const void* const* wptrs, const int* xcol, const void* x_q8_1, float* y, int n_in, int n_out,
+                  int ncols, void* stream) {
+    if (!wptrs || ncols < 1) return;
+    static const int rpb = [] { const char* v = std::getenv("STRATA_MMVQ_PTRS_RPB"); return v ? std::atoi(v) : 4; }();
+    const dim3 block(32, (unsigned) rpb), grid((unsigned) ((n_out + rpb - 1) / rpb));
+    cudaStream_t s = (cudaStream_t) stream;
+    switch (t) {
+#define STRATA_MMVQ_PTRS(T)                                                                                            \
+    case T:                                                                                                            \
+        if (rpb == 8)                                                                                                  \
+            mmvq_ptrs_kernel<T, 8><<<grid, block, 0, s>>>((const uint8_t* const*) wptrs, iq_row_bytes(T, n_in),      \
+                                                          (const block_q8_1*) x_q8_1, y, n_in, n_out, ncols, xcol);   \
+        else                                                                                                           \
+            mmvq_ptrs_kernel<T, 4><<<grid, block, 0, s>>>((const uint8_t* const*) wptrs, iq_row_bytes(T, n_in),      \
+                                                          (const block_q8_1*) x_q8_1, y, n_in, n_out, ncols, xcol);   \
+        break;
+        STRATA_MMVQ_FMTS(STRATA_MMVQ_PTRS)
+#undef STRATA_MMVQ_PTRS
+        default: std::fprintf(stderr, "iq_mmvq_ptrs: type %d is not supported\n", t); std::exit(1);
+    }
+    check("iq_mmvq_ptrs");
+}
 
 void iq_embed_rows(int t, const void* table, size_t row_bytes, const int32_t* tokens, int64_t n_tok, int64_t n_embd,
                    float* out, void* stream) {
@@ -7103,3 +7205,6 @@ bool gemm_iq_f16_grouped(int, const void*, size_t, int, int, const void*, int, c
 }
 }  // namespace strata::kernels
 #endif
+
+
+
