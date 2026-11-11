@@ -61,12 +61,18 @@ class SolarEntry(unittest.TestCase):
             self.assertNotIn("solar", d.get("families", ()))
         self.assertNotIn("mmproj", setup.OWN_PATH_FAMILIES["solar"])   # text only: no picture file to fetch
 
-    def test_one_size_and_the_context_the_model_was_trained_for(self):
+    def test_one_size_and_the_context_follows_the_card(self):
         fam = setup.OWN_PATH_FAMILIES["solar"]
         self.assertEqual(setup.own_path_size(fam, 16.0), "IQ3_XXS")    # the only size, whatever the RAM
         self.assertEqual(setup.own_path_size(fam, 64.0), "IQ3_XXS")
-        for vram in (12.0, 16.0, 24.0):
-            self.assertEqual(setup.own_path_context(fam, vram), 131072, vram)
+        # 192 KiB of KV per token: 128K would be 24 GiB of VRAM, so the recommendation keeps room for the expert cache
+        self.assertEqual(setup.own_path_context(fam, 16.0, "IQ3_XXS"), 8192)
+        self.assertEqual(setup.own_path_context(fam, 24.0, "IQ3_XXS"), 65536)
+        self.assertEqual(setup.own_path_context(fam, 32.0, "IQ3_XXS"), 65536)
+        self.assertEqual(setup.own_path_context(fam, 48.0, "IQ3_XXS"), 131072)
+        self.assertEqual(setup.own_path_context(fam, 0.0, "IQ3_XXS"), 131072)   # no card known: as before
+        self.assertEqual(setup.own_path_contexts(fam)[-1], 131072)             # the menu stops at the trained length
+        self.assertNotIn(262144, setup.own_path_contexts(fam))
 
     def test_the_effort_default_is_the_template_s_minimal(self):
         self.assertEqual(setup.OWN_PATH_FAMILIES["solar"]["config"], {"reasoning_effort": "minimal"})
@@ -129,7 +135,7 @@ class InstallSolar(unittest.TestCase):
         self.assertNotIn("vision", self.cfg)
         a = self.cfg["args"]
         self.assertEqual(a[a.index("--native") + 1], str(gguf))
-        self.assertEqual(a[a.index("--max-context") + 1], "131072")
+        self.assertEqual(a[a.index("--max-context") + 1], "8192")   # 128K would be 24 GiB of KV on this 16 GB card
         self.assertEqual(a[a.index("--mtp") + 1], "0")
         self.assertNotIn("--pack", a)
         self.assertNotIn("--vision", a)

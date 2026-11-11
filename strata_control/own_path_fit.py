@@ -35,6 +35,15 @@ HYBRID_MIN_GIB = {"UD-Q4_K_XL": 1256 / 1024, "UD-Q6_K_XL": 1760 / 1024, "Q8_0": 
 FAMILY_NAME = "qwen3.6-35b-a3b"                                # setup.py OWN_PATH_FAMILIES['qwen36']['name'], the config's model_name prefix
 DEFAULT_CONTEXT = 131072                                       # 128K (owner, 2026-11-01): the mark never goes above it
 MENU = [8192, 32768, 65536, 131072, 204800, 262144]           # setup's own-path context menu (setup.own_path_contexts(); a test keeps them equal)
+# Families with one size and figures of their own (the hybrid tables above are Qwen3.6's).  Solar-Open-100B
+# (glm4moe): 48 layers x 8 KV heads x 128 x 2 (K, V) x 2 bytes (fp16) = 192 KiB per token, and the fixed part is the
+# dense weights and the engine's buffers (~5.8 GiB) plus the VRAM expert cache the port was measured with (~5.5 GiB,
+# about 1000 of its 5.74 MiB slots).  The engine allocates a session before the cache and the cache takes what is
+# left; a context that leaves the cache nothing runs at 3.5 tok/s, so the recommendation keeps it.  Measured on the
+# 16 GB card: 8192 -> 1,650 slots, 93% hit rate; 128K would need 24 GiB for the cache alone and cannot start.
+EXTRA_FAMILIES = {
+    "solar-open-100b": {"bytes_per_token": 48 * 8 * 128 * 2 * 2, "fixed_gb": 5.8 + 5.5},
+}
 
 
 def fixed_gib(model: str | None) -> float | None:
@@ -45,13 +54,20 @@ def fixed_gib(model: str | None) -> float | None:
 
 def inputs(name: str | None, model: str | None) -> dict | None:
     """The formula's inputs for a family name ("qwen3.6-35b-a3b") and size, as the catalog row carries them to the app; None: not known."""
-    f = fixed_gib(model) if str(name or "").lower() == FAMILY_NAME else None
+    key = str(name or "").lower()
+    extra = EXTRA_FAMILIES.get(key)
+    if extra is not None:
+        return dict(extra)
+    f = fixed_gib(model) if key == FAMILY_NAME else None
     return None if f is None else {"bytes_per_token": BYTES_PER_TOKEN, "fixed_gb": round(f, 4)}
 
 
 def from_model_name(model_name: str | None) -> dict | None:
     """The inputs from a config's model_name ("qwen3.6-35b-a3b-ud-q4_k_xl"), None for any other model."""
     low = str(model_name or "").lower()
+    for key in EXTRA_FAMILIES:
+        if low.startswith(key + "-"):
+            return inputs(key, None)
     if not low.startswith(FAMILY_NAME + "-"):
         return None
     size = low[len(FAMILY_NAME) + 1:]

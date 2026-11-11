@@ -799,6 +799,7 @@ OWN_PATH_FAMILIES = {
               "sha256": SOLAR_FILES,
               # 48 layers x 8 KV heads x 128 keys and values x 2 (K, V) x 2 bytes (fp16): 192 KiB per token
               "kv_bytes_per_token": 48 * 8 * 128 * 2 * 2,
+              "trained_context": 131072,       # the model card's 128K: the menu stops there (no rope scaling on this path)
               "mtp": 0,                        # no draft layer; the engine accepts --mtp and ignores it
               "cuda_only": True,               # the engine path is built for CUDA only
               "parallel": False,               # measured (and tuned) one request at a time
@@ -8824,22 +8825,23 @@ def feed_models_setup(feed: str | None = None, fetch: bool = True) -> None:
         feed_models.apply(_SetupTables(), loaded.models, feed_engine_families())
 
 
-def own_path_contexts() -> list:
-    """The context sizes the own-path menu offers: up to the model's trained 262,144 (no rope scaling on this path yet)."""
-    return [c for c in CONTEXTS if c <= 262144]
+def own_path_contexts(fam: dict | None = None) -> list:
+    """The context sizes the own-path menu offers: up to the model's trained length (no rope scaling on this path yet)."""
+    cap = int((fam or {}).get("trained_context", 262144))
+    return [c for c in CONTEXTS if c <= cap]
 
 
 def own_path_context(fam: dict, vram_gb: float, model: str | None = None) -> int:
     """The recommended context for an own-path family: 128K (owner, 2026-11-01), or on a card where 128K does not fit the largest
     size that does (#5715, strata_control/own_path_fit.py; the smallest when none fits).  A recommendation only: any size can be chosen."""
     from strata_control import own_path_fit
-    return own_path_fit.recommended(own_path_fit.inputs(fam.get("name"), model), vram_gb, own_path_contexts())
+    return own_path_fit.recommended(own_path_fit.inputs(fam.get("name"), model), vram_gb, own_path_contexts(fam))
 
 
 def own_path_context_warning(fam: dict, model: str, vram_gb: float, ctx: int) -> str | None:
     """The sentence said when the chosen context does not fit the card (#5715); None when it fits or cannot be said."""
     from strata_control import own_path_fit
-    return own_path_fit.warning(own_path_fit.inputs(fam.get("name"), model), vram_gb, ctx, own_path_contexts())
+    return own_path_fit.warning(own_path_fit.inputs(fam.get("name"), model), vram_gb, ctx, own_path_contexts(fam))
 
 
 def own_path_size(fam: dict, ram: float) -> str:
@@ -8997,7 +8999,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     if a.context:
         ctx = a.context
     else:
-        ctxs = own_path_contexts()                     # the model's trained length; no rope scaling on this path yet
+        ctxs = own_path_contexts(fam)                  # the model's trained length; no rope scaling on this path yet
         say()
         say("  Context length = how much text the model can see at once. Its cache takes "
             f"{fam['kv_bytes_per_token'] * 32768 / 2**30:.1f} GB of VRAM per 32K tokens, room the experts would use:")
@@ -9005,9 +9007,10 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
             say(f"  {i}) {c // 1024}K tokens" + ("   (recommended for your GPU)" if c == rec_ctx else ""))
         ctx = ctxs[int(ask("Context?", [str(i) for i in range(1, len(ctxs) + 1)], str(ctxs.index(rec_ctx) + 1),
                            a.yes)) - 1]
-    if ctx > 262144:
-        warn(f"{ctx // 1024}K is past {fam['title']}'s trained 262,144 positions and this engine path has no rope "
-             "scaling yet: kept as you chose, but answers past 256K are untested")
+    trained = int(fam.get("trained_context", 262144))
+    if ctx > trained:
+        warn(f"{ctx // 1024}K is past {fam['title']}'s trained {trained:,} positions and this engine path has no rope "
+             "scaling yet: kept as you chose, but answers past that are untested")
     too_big = own_path_context_warning(fam, model, float(gpu.get("vram_gb", 0.0)), ctx)
     if too_big:                                        # #5715: said before the start; the choice is kept (recommend, never force)
         warn(too_big)
