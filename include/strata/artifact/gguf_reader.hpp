@@ -640,6 +640,40 @@ inline ModelFamily model_family(const GgufFile& g) {
     return arch ? model_family_from_arch(arch->s) : ModelFamily::Unknown;
 }
 
+/// Solar-Open-100B's guard: every key the geometry is read from must be present.
+inline std::string check_architecture_glm4moe(const GgufFile& g) {
+    static const char* const keys[] = {
+        "glm4moe.block_count", "glm4moe.embedding_length", "glm4moe.attention.head_count",
+        "glm4moe.attention.head_count_kv", "glm4moe.attention.key_length", "glm4moe.attention.value_length",
+        "glm4moe.expert_count", "glm4moe.expert_used_count", "glm4moe.expert_feed_forward_length",
+        "glm4moe.expert_shared_count", "glm4moe.leading_dense_block_count", "glm4moe.rope.dimension_count",
+        "glm4moe.rope.freq_base",
+        "glm4moe.attention.layer_norm_rms_epsilon", "glm4moe.expert_gating_func",
+    };
+    for (const char* k : keys) {
+        const MetaValue* v = g.get(k);
+        if (!v) return std::string("missing ") + k;
+        if (!v->is_num()) return std::string(k) + " is not a number";
+    }
+    const auto& block = g.get("glm4moe.block_count")->u;
+    const auto& dense = g.get("glm4moe.leading_dense_block_count")->u;
+    const auto& heads = g.get("glm4moe.attention.head_count")->u;
+    const auto& kv = g.get("glm4moe.attention.head_count_kv")->u;
+    const auto& used = g.get("glm4moe.expert_used_count")->u;
+    const auto& experts = g.get("glm4moe.expert_count")->u;
+    const auto& key_len = g.get("glm4moe.attention.key_length")->u;
+    const auto& value_len = g.get("glm4moe.attention.value_length")->u;
+    const auto& rot = g.get("glm4moe.rope.dimension_count")->u;
+    if (block == 0) return "glm4moe.block_count is zero";
+    if (dense > block) return "glm4moe.leading_dense_block_count is larger than block_count";
+    if (heads == 0 || kv == 0 || heads % kv != 0) return "glm4moe attention heads are not a multiple of KV heads";
+    if (key_len == 0 || key_len != value_len) return "glm4moe attention.key_length != attention.value_length";
+    if (rot == 0 || rot % 2 != 0 || rot > key_len) return "glm4moe.rope.dimension_count is not an even slice of the head";
+    if (experts == 0 || used == 0 || used > experts) return "glm4moe expert_used_count is out of range";
+    if (g.get("glm4moe.expert_gating_func")->u != 2) return "glm4moe.expert_gating_func is not sigmoid (2)";
+    return {};
+}
+
 /// Qwen3.6-35B-A3B's guard: every key the geometry is read from must be present (core::geometry_from_gguf),
 /// and the few that the layer pattern depends on must have the values the model has.
 inline std::string check_architecture_qwen35moe(const GgufFile& g) {
@@ -851,6 +885,7 @@ inline std::string check_architecture(const GgufFile& f) {
     if (!arch) return "missing general.architecture";
     const ModelFamily family = model_family_from_arch(arch->s);
     if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35moe(f);
+    if (family == ModelFamily::Glm4Moe) return check_architecture_glm4moe(f);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);

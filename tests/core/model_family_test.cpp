@@ -52,12 +52,40 @@ struct Dims {
 // Qwen3.6-35B-A3B (unsloth/Qwen3.6-35B-A3B-MTP-GGUF, every quant) and Qwen3.8-Flash-Next, as their files say
 const Dims kQwen36 = {41, 2048, 16, 2, 256, 256, 8, 512, 512, 4, 128, 16, 32, 4096, 4, 1, 0, 0, 0, 0};
 const Dims kFlashNext = {48, 2560, 24, 2, 256, 512, 10, 640, 640, 4, 128, 16, 48, 6144, 4, 0, 4, 320, 4, 128};
+// Solar-Open-100B (glm4moe): no GDN, no MTP, no hyper-connections, no indexer; every layer is dense attention
+const Dims kSolar = {48, 4096, 64, 8, 128, 128, 8, 1280, 1280, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0};
 // tiny models of each family for the layout checks (every tensor F32, a few KB)
 const Dims kTiny36 = {5, 64, 2, 1, 16, 4, 2, 32, 32, 4, 8, 2, 4, 32, 4, 1, 0, 0, 0, 0};
 const Dims kTinyFlash = {8, 64, 2, 1, 16, 4, 2, 32, 32, 4, 8, 2, 4, 32, 4, 0, 2, 8, 2, 8};
+const Dims kTinyGlm = {3, 64, 2, 1, 16, 4, 2, 32, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0};
 
 std::vector<Kv> metadata(const char* arch, const Dims& d, uint64_t vocab) {
     const std::string p = std::string(arch) + ".";
+    if (std::string(arch) == "glm4moe") {
+        // Solar-Open-100B's own key set: no ssm.*, no shared width, sigmoid gating, weight-normed experts
+        std::vector<Kv> kv = {fixture::str("general.architecture", arch),
+                              fixture::u32(p + "block_count", d.block_count),
+                              fixture::u32(p + "embedding_length", d.embd),
+                              fixture::u32(p + "attention.head_count", d.heads),
+                              fixture::u32(p + "attention.head_count_kv", d.heads_kv),
+                              fixture::u32(p + "attention.key_length", d.key_len),
+                              fixture::u32(p + "attention.value_length", d.key_len),
+                              fixture::f32(p + "attention.layer_norm_rms_epsilon", 1e-5f),
+                              fixture::u32(p + "expert_count", d.experts),
+                              fixture::u32(p + "expert_used_count", d.used),
+                              fixture::u32(p + "expert_feed_forward_length", d.ff),
+                              fixture::u32(p + "expert_shared_count", 1),
+                              fixture::u32(p + "expert_gating_func", 2),
+                              fixture::u32(p + "expert_weights_scale", 1),
+                              fixture::u32(p + "expert_weights_norm", 1),
+                              fixture::u32(p + "leading_dense_block_count", 0),
+                              fixture::u32(p + "rope.dimension_count", d.key_len),
+                              fixture::f32(p + "rope.freq_base", 1e6f)};
+        std::vector<std::string> tokens;
+        for (uint64_t i = 0; i < vocab; ++i) tokens.push_back("t" + std::to_string(i));
+        kv.push_back(fixture::str_array("tokenizer.ggml.tokens", tokens));
+        return kv;
+    }
     std::vector<Kv> kv = {fixture::str("general.architecture", arch),
                           fixture::u32(p + "block_count", d.block_count),
                           fixture::u32(p + "embedding_length", d.embd),
@@ -115,7 +143,7 @@ std::string layout_error(const fs::path& dir, const char* arch, const Dims& d, u
     strata::core::ModelGeometry g;
     int64_t k = 0;
     std::string err;
-    if (std::string(arch) == "qwen35moe") {
+    if (std::string(arch) == "qwen35moe" || std::string(arch) == "glm4moe") {
         if (!geometry_of(meta, g, k, err)) return "geometry: " + err;
     } else {
         // the qwen4exp guard pins Flash-Next's own block count and widths, so the tiny model's geometry is set here
@@ -286,6 +314,35 @@ int main(int argc, char** argv) {
                 if (it->name == "blk.3.indexer.k_proj.weight") { ts.erase(it); break; }
         });
         check(e == "missing blk.3.indexer.k_proj.weight", "Flash-Next: a missing indexer tensor is refused (" + e + ")");
+    }
+    {
+        // Solar-Open-100B (glm4moe): the guard, the geometry, the layout
+        const fs::path sol = d.path / "solar.gguf", tiny = d.path / "tinyglm.gguf";
+        fixture::write(sol, metadata("glm4moe", kSolar, 196608), {});
+        const strata::GgufFile f(sol.string());
+        check(strata::model_family(f) == strata::ModelFamily::Glm4Moe, "model_family: glm4moe is Solar-Open-100B");
+        check(strata::check_architecture(f).empty(), "the architecture guard accepts glm4moe");
+        strata::core::ModelGeometry g;
+        int64_t k = 0;
+        std::string err;
+        const bool ok = geometry_of(sol, g, k, err);
+        check(ok, "Solar geometry reads" + (ok ? std::string() : ": " + err));
+        check(g.family == strata::ModelFamily::Glm4Moe && g.n_layers == 48 && g.n_mtp_layers == 0 &&
+                  g.n_embd == 4096 && g.n_head == 64 && g.n_head_kv == 8 && g.head_dim == 128 && g.n_rot == 128,
+              "Solar: 48 layers, hidden 4096, attention 64/8 x 128, rope 128");
+        check(g.n_expert == 128 && k == 8 && g.n_ff == 1280 && g.n_ff_shexp == 1280 && g.n_expert_shared == 1 &&
+                  g.n_layer_dense_lead == 0 && g.qsa_interval == 1,
+              "Solar MoE: 128 experts top-8, FF 1280, one shared expert, every layer dense");
+        check(!g.has_indexer() && !g.has_hyper_connections() && g.expert_weights_norm && g.expert_weights_scale == 1.0,
+              "Solar: no indexer, no hyper-connections, weight-normed experts, scale 1");
+        check(!strata::core::compiled_geometry_mismatch(g).empty(), "Solar does not match the compiled kernels");
+        check(layout_error(d.path, "glm4moe", kTinyGlm, 16, nullptr).empty(),
+              "a complete glm4moe file passes its layout");
+        const std::string e = layout_error(d.path, "glm4moe", kTinyGlm, 16, [](std::vector<Tensor>& ts) {
+            for (auto& t : ts)
+                if (t.name == "blk.1.attn_q.weight") t.shape[1] *= 2;
+        });
+        check(e.find("blk.1.attn_q.weight") != std::string::npos, "a wrong glm4moe attention width is refused");
     }
     std::printf(g_fail ? "FAILED (%d)\n" : "ALL PASSED\n", g_fail);
     return g_fail ? 1 : 0;

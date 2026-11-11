@@ -16,11 +16,13 @@ enum class ModelFamily {
     Unknown = 0,
     Qwen4Exp,    ///< Qwen3.8-Flash-Next and its fine-tunes / pruned variants (Swift 1.5, the Coder)
     Qwen35Moe,   ///< Qwen3.6-35B-A3B (Unsloth's MTP GGUFs): plain pre-norm residual, dense attention, nextn MTP block
+    Glm4Moe,     ///< Solar-Open-100B: standard GQA + sigmoid routed MoE + one shared expert, no MTP
 };
 
 inline ModelFamily model_family_from_arch(const std::string& arch) {
     if (arch == "qwen4exp") return ModelFamily::Qwen4Exp;
     if (arch == "qwen35moe") return ModelFamily::Qwen35Moe;
+    if (arch == "glm4moe") return ModelFamily::Glm4Moe;
     return ModelFamily::Unknown;
 }
 
@@ -31,6 +33,8 @@ inline const char* model_family_arch(ModelFamily f) {
         return "qwen4exp";
     case ModelFamily::Qwen35Moe:
         return "qwen35moe";
+    case ModelFamily::Glm4Moe:
+        return "glm4moe";
     default:
         return "";
     }
@@ -43,6 +47,8 @@ inline const char* model_family_title(ModelFamily f) {
         return "Qwen3.8-Flash-Next";
     case ModelFamily::Qwen35Moe:
         return "Qwen3.6-35B-A3B";
+    case ModelFamily::Glm4Moe:
+        return "Solar-Open-100B";
     default:
         return "an unknown model";
     }
@@ -58,8 +64,8 @@ inline std::string model_family_not_supported(ModelFamily f) {
     if (model_family_runs(f)) return {};
     if (f == ModelFamily::Unknown) return "this is not a model family Strata knows";
     return std::string(model_family_title(f)) + " (architecture '" + model_family_arch(f) +
-           "') runs on the NVIDIA (CUDA) and AMD (HIP) builds of Strata; this build does not run it yet (the Intel "
-           "Arc / SYCL port is in development). Use a CUDA or HIP build, or a Qwen3.8-Flash-Next model file";
+           "') is recognised, but this build does not run it yet (it has no engine path for that family). "
+           "Use a build with that family, or a supported model file";
 }
 
 }  // namespace strata

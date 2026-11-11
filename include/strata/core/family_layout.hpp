@@ -35,6 +35,53 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
     const std::string p = std::string(strata::model_family_arch(family)) + ".";
     g = ModelGeometry{};
     g.family = family;
+    if (family == strata::ModelFamily::Glm4Moe) {
+        const std::string q = "glm4moe.";
+        auto num = [&](const char* key, int64_t& dst) {
+            if (const strata::MetaValue* v = meta.get(q + key)) dst = (int64_t) v->u;
+        };
+        num("block_count", g.n_layers);
+        num("embedding_length", g.n_embd);
+        num("attention.head_count", g.n_head);
+        num("attention.head_count_kv", g.n_head_kv);
+        num("attention.key_length", g.head_dim);
+        num("expert_count", g.n_expert);
+        num("expert_used_count", top_k);
+        num("expert_feed_forward_length", g.n_ff);
+        g.n_ff_shexp = g.n_ff;  // glm4moe files carry no separate shared width; the shared expert is n_ff wide
+        num("expert_shared_feed_forward_length", g.n_ff_shexp);
+        num("expert_shared_count", g.n_expert_shared);
+        num("leading_dense_block_count", g.n_layer_dense_lead);
+        num("rope.dimension_count", g.n_rot);
+        if (const strata::MetaValue* v = meta.get(q + "attention.layer_norm_rms_epsilon")) g.rms_eps = v->num();
+        if (const strata::MetaValue* v = meta.get(q + "expert_weights_scale")) g.expert_weights_scale = v->num();
+        if (const strata::MetaValue* v = meta.get(q + "expert_weights_norm")) g.expert_weights_norm = v->u != 0;
+        g.n_expert_used = top_k;
+        g.n_mtp_layers = 0;
+        g.qsa_interval = 1;       // all layers are dense attention
+        g.ssm_state_size = g.ssm_k_heads = g.ssm_v_heads = g.ssm_d_conv = g.ssm_value_dim = g.ssm_conv_channels = 0;
+        g.hc = g.hc_lr = 0;
+        g.idx_q_heads = g.idx_key_dim = g.idx_block = g.idx_top_k = 0;
+        if (const strata::MetaValue* v = meta.get("tokenizer.ggml.tokens"))
+            if (v->type == strata::MetaType::ARRAY && v->count > 0) g.n_vocab = (int64_t) v->count;
+        char buf[256];
+        auto bad = [&](const char* what) {
+            std::snprintf(buf, sizeof buf, "%s: %s", meta.path().c_str(), what);
+            err = buf;
+            return false;
+        };
+        if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_head <= 0 || g.n_head_kv <= 0 || g.head_dim <= 0 ||
+            g.n_expert <= 0 || top_k <= 0 || top_k > g.n_expert || g.n_ff <= 0 || g.n_ff_shexp <= 0)
+            return bad("a geometry key is zero or out of range");
+        if (g.n_layer_dense_lead < 0 || g.n_layer_dense_lead > g.n_layers)
+            return bad("leading_dense_block_count is out of range");
+        if (g.n_expert_shared < 0 || g.n_expert_shared > 8)
+            return bad("expert_shared_count is out of range");
+        if (g.n_head % g.n_head_kv) return bad("attention.head_count is not a multiple of attention.head_count_kv");
+        if (g.n_rot <= 0 || g.n_rot > g.head_dim || g.n_rot % 2)
+            return bad("rope.dimension_count is not an even slice of the head width");
+        return true;
+    }
     // a key the file carries replaces the default; `required` keys were checked present by the guard
     auto num = [&](const char* key, int64_t& dst) {
         if (const strata::MetaValue* v = meta.get(p + key))
@@ -156,6 +203,25 @@ inline std::vector<TensorWant> layer_tensors(const ModelGeometry& g, int64_t lay
     const int64_t N = g.n_embd, NE = g.n_expert, FF = g.n_ff, FS = g.n_ff_shexp;
     std::vector<TensorWant> t;
     auto add = [&](const char* s, std::vector<int64_t> shape) { t.push_back({s, std::move(shape)}); };
+    if (g.family == strata::ModelFamily::Glm4Moe) {
+        // Solar-Open-100B: plain pre-norm residual, standard GQA (no output gate, no QK norm),
+        // sigmoid routed experts plus one always-on shared expert whose gate is not a tensor.
+        add("attn_norm.weight", {N});
+        add("post_attention_norm.weight", {N});
+        add("attn_q.weight", {N, g.n_head * g.head_dim});
+        add("attn_k.weight", {N, g.n_head_kv * g.head_dim});
+        add("attn_v.weight", {N, g.n_head_kv * g.head_dim});
+        add("attn_output.weight", {g.n_head * g.head_dim, N});
+        add("ffn_gate_inp.weight", {N, NE});
+        add("exp_probs_b.bias", {NE});
+        add("ffn_gate_shexp.weight", {N, FS});
+        add("ffn_up_shexp.weight", {N, FS});
+        add("ffn_down_shexp.weight", {FS, N});
+        add("ffn_gate_exps.weight", {N, FF, NE});
+        add("ffn_up_exps.weight", {N, FF, NE});
+        add("ffn_down_exps.weight", {FF, N, NE});
+        return t;
+    }
     // MoE, every layer (the MTP block's too)
     add("ffn_gate_inp.weight", {N, NE});
     add("ffn_gate_inp_shexp.weight", {N});

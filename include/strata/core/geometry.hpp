@@ -58,6 +58,10 @@ struct ModelGeometry {
     int64_t n_ff_shexp = 640;       ///< the shared expert's FFN width (qwen4exp: equal to n_ff, read_geometry checks)
     ModelFamily family = ModelFamily::Qwen4Exp;
     int64_t n_mtp_layers = 0;       ///< MTP blocks inside the model file, after the trunk (qwen35moe: blk.40)
+    int64_t n_expert_shared = 0;    ///< expert_shared_count (glm4moe: 1)
+    int64_t n_layer_dense_lead = 0; ///< leading_dense_block_count (glm4moe: 0)
+    bool expert_weights_norm = false; ///< glm4moe.expert_weights_norm
+    double expert_weights_scale = 1.0; ///< glm4moe.expert_weights_scale
 
     constexpr bool has_indexer() const { return idx_q_heads > 0; }              ///< false: dense attention only
     constexpr bool has_hyper_connections() const { return hc > 0; }             ///< false: plain pre-norm residual
