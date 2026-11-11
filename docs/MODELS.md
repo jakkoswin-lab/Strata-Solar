@@ -309,6 +309,25 @@ path has only run on NVIDIA cards. One request at a time.
 and the 4-bit files no longer fit the experts in RAM on a machine that pins them. No picture reader, no parallel
 slots on this path.
 
+### The model file
+
+The file is mradermacher's i1 IQ3_XXS **used exactly as published** — nothing is repacked, re-quantized or rewritten:
+
+| | |
+| --- | --- |
+| Name | `Solar-Open-100B.i1-IQ3_XXS.gguf` |
+| Size | 39,679,136,160 bytes |
+| SHA-256 | `11166281d4e2a06fa3b12df6a7e26ab7c04ba77cdd1867fb557d8df07bc1ba43` |
+| Source | [mradermacher/Solar-Open-100B-i1-GGUF](https://huggingface.co/mradermacher/Solar-Open-100B-i1-GGUF) at commit `b324d3dc` |
+
+The engine maps the GGUF and reads the tensors in place (its log says "routed experts in the mmap"); it is a standard
+`glm4moe` GGUF that llama.cpp reads just as well. Setup writes one thing beside it: a `tokenizer/` folder (five small
+files taken from the GGUF's own metadata) under the data folder, which the HTTP server uses. The GGUF is untouched.
+
+A copy you already have is accepted with `--gguf-dir`, checked against the same size and SHA-256, and an incomplete or
+different file is refused before anything starts. The engine expects the standard llama.cpp `glm4moe` tensor layout:
+a file of another shape is refused by name, not run.
+
 **Measured on:** RTX 5060 Ti (16 GB), 64 GB of RAM, the file on an NVMe, IQ3_XXS.
 
 | | |

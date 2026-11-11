@@ -55,6 +55,12 @@ With a model file already on disk:
 python setup.py --family solar --gguf-dir <folder with Solar-Open-100B.i1-IQ3_XXS.gguf>
 ```
 
+The model file is [mradermacher's i1 IQ3_XXS](https://huggingface.co/mradermacher/Solar-Open-100B-i1-GGUF), used
+**exactly as published** (`Solar-Open-100B.i1-IQ3_XXS.gguf`, 39,679,136,160 bytes, SHA-256 `11166281…ba43`). Nothing is
+repacked or rewritten: the engine maps the GGUF and reads it in place, and setup only writes a small `tokenizer/`
+folder taken from its metadata. A copy you already have is checked against the same size and SHA-256. Details:
+[docs/MODELS.md](docs/MODELS.md#solar-open-100b).
+
 ## Models
 
 We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where a compatible model fits.
