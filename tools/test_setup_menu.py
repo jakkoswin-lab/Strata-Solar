@@ -21,8 +21,14 @@ import setup  # noqa: E402
 
 class FamilyOrder(unittest.TestCase):
     def test_the_menu_order_on_nvidia(self):
+        # own-path families come after the Flash-Next ones, in definition order (solar after qwen36)
         fams = setup.menu_families(False) + list(setup.OWN_PATH_FAMILIES)
-        self.assertEqual(fams, ["qwen", "swift", "coder", "unsloth", "gyro", "nvfp4", "qwen36"])
+        self.assertEqual(fams, ["qwen", "swift", "coder", "unsloth", "gyro", "nvfp4", "qwen36", "solar"])
+
+    def test_a_cuda_only_own_path_family_is_not_offered_on_amd(self):
+        # the menu drops it (install_own_path refuses it by name if --family solar is given anyway)
+        self.assertTrue(setup.OWN_PATH_FAMILIES["solar"].get("cuda_only"))
+        self.assertFalse(setup.OWN_PATH_FAMILIES["qwen36"].get("cuda_only"))
 
     def test_the_default_stays_the_first_family(self):
         self.assertEqual(setup.menu_families(False)[0], "qwen")

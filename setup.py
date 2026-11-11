@@ -104,6 +104,7 @@ HF_REVISIONS = {
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": "1ada08422e404aca51ab9df665f089f34c419c6b",           # 2026-10-13
     "unsloth/DeepSeek-V4.1-Flash-1017-GGUF": "8a6ec9cf118e785a362ea94ee123c61c70553be6",             # 2026-10-30 (adds UD-IQ1_S / UD-IQ1_M; every file pinned from the 2026-10-20 commit has the same size and SHA-256 here)
     "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF": "cb02422c900df489cea5833e8a92171224059b3c",    # 2026-10-24 (ISTA-DASLab's final 1.75 / 2.00 / 2.25 bpw sets and Engram)
+    "mradermacher/Solar-Open-100B-i1-GGUF": "b324d3dc6a2a1a82d77d52e20272b9c66cbbe569",              # 2026-01-17
 }
 
 
@@ -755,6 +756,13 @@ QWEN36_FILES = {
     "Qwen3.6-35B-A3B-Q8_0.gguf": (37801097504, "c1283d8b80c3e38b2735ddbc9766d3b3126f44d6c484be419d4e101d09a76131"),
     "mmproj-F16.gguf": (899283584, "71f3cbc1f7cc0f30d09d41cfa924c0060827ebc33bf15ace7e86661e856f0160"),
 }
+# Upstage's Solar-Open-100B (GGUF architecture glm4moe), mradermacher's i1 (imatrix) IQ3_XXS: one 39.7 GB file, no
+# pack.  Only this size is offered: IQ2_XXS measured 0.44-0.48 bits worse per token and looped on a Chinese prompt
+# (docs/SOLAR_PORT.md), and the larger sizes need more RAM than the experts' 34.45 GiB pinning already takes.
+SOLAR_FILES = {
+    "Solar-Open-100B.i1-IQ3_XXS.gguf":
+        (39679136160, "11166281d4e2a06fa3b12df6a7e26ab7c04ba77cdd1867fb557d8df07bc1ba43"),
+}
 OWN_PATH_FAMILIES = {
     "qwen36": {"title": "Qwen3.6-35B-A3B", "by": "Qwen; GGUFs with the MTP layer by Unsloth", "arch": "qwen35moe",
                "about": "35B mixture of experts with 3B active (256 experts, top-8): a smaller cousin of "
@@ -776,7 +784,26 @@ OWN_PATH_FAMILIES = {
                # pictures: Unsloth's mmproj (the same projector family as Flash-Next's: qwen3vl_merger) through
                # strata-vision; a parallel slot's session: its KV cache (kv_bytes_per_token) and the recurrent state of
                # the 30 GDN layers (state_gb)
-               "vision": True, "state_gb": 0.07}
+               "vision": True, "state_gb": 0.07},
+    # Upstage's Solar-Open-100B: 100B mixture of experts (128 experts, top-8) for Korean and English.  Its engine
+    # path (src/glm4) keeps the routed experts in mapped pinned host memory and fills a VRAM LRU from a captured
+    # graph, which has only run on NVIDIA cards, so it is CUDA-only (cmake/strata_gpu_engine.cmake); the sizes it
+    # was measured with are single-stream (docs/SOLAR_PORT.md), hence no parallel offer.
+    "solar": {"title": "Solar-Open-100B", "by": "Upstage AI; i1 quants by mradermacher", "arch": "glm4moe",
+              "about": "100B mixture of experts with 8 active (128 experts, top-8), Korean and English, 128K "
+                       "context; the experts stay in RAM and are copied into VRAM as each token's routing asks",
+              "hf": hf("mradermacher/Solar-Open-100B-i1-GGUF"), "file": "Solar-Open-100B.i1-{q}.gguf",
+              "tag": "solar-", "name": "solar-open-100b",
+              "license": "Upstage Solar Open Model License: https://huggingface.co/upstage/Solar-Open-100B",
+              "models": {"IQ3_XXS": {"about": "3-bit i-quant (i1, imatrix); the size this engine path was validated "
+                                               "with", "ram_gb": 48}},
+              "sha256": SOLAR_FILES,
+              # 48 layers x 8 KV heads x 128 keys and values x 2 (K, V) x 2 bytes (fp16): 192 KiB per token
+              "kv_bytes_per_token": 48 * 8 * 128 * 2 * 2,
+              "mtp": 0,                        # no draft layer; the engine accepts --mtp and ignores it
+              "cuda_only": True,               # the engine path is built for CUDA only
+              "parallel": False,               # measured (and tuned) one request at a time
+              "config": {"reasoning_effort": "minimal"}}   # its template's empty think block: answer, no reasoning trace
 }
 PREVIEW_FAMILIES = OWN_PATH_FAMILIES             # the earlier name (tools and tests that import it)
 
@@ -1031,6 +1058,7 @@ REPO_PINS = {
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": CODER_FILES,
     UNSLOTH_REPO: {**UNSLOTH_V31_SHARDS, **UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS},
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": QWEN36_FILES,
+    "mradermacher/Solar-Open-100B-i1-GGUF": SOLAR_FILES,
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": GYRO_FILES,
     "unsloth/DeepSeek-V4.1-Flash-1017-GGUF": DSV41_FILES,
     "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF": DSV41_ISTA_FILES,
@@ -8826,6 +8854,8 @@ def own_path_vision(a, fam: dict, gpu: dict, hip: bool) -> str:
     2026-10-18) and the reader follows strata_control/vision_reader.py's one rule on every make of card: the CPU encoder under 24 GB of
     VRAM (the GPU one takes ~1.4 GB the experts would use), the GPU encoder from 24 GB.  --vision yes|no|gpu|cpu, else a question whose
     default answer is yes; what is asked for with --vision gpu / cpu is kept, with a note (recommend, never force)."""
+    if not fam.get("mmproj"):
+        return "none"                                # a family with no picture file (Solar-Open-100B): text only
     asked = a.vision
     vram = float(gpu.get("vram_gb", 0.0))
     if asked in ("no", "none"):
@@ -8856,7 +8886,7 @@ def own_path_vision(a, fam: dict, gpu: dict, hip: bool) -> str:
 def own_path_parallel_slot_gb(fam: dict, ctx: int) -> float:
     """The VRAM one batch slot's session takes: its KV cache (fp32 K and V of the attention layers and the MTP block) and
     the recurrent state of the GDN layers."""
-    return ctx * fam["kv_bytes_per_token"] / 1e9 + fam["state_gb"]
+    return ctx * fam["kv_bytes_per_token"] / 1e9 + fam.get("state_gb", 0.0)
 
 
 PARALLEL_SMALL_SHARE = 0.35     # a card that does not hold every expert: the slots' sessions may take this share of the room the
@@ -8931,6 +8961,9 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     script.  The engine places the experts itself (every one in VRAM when they fit, else the most-used ones there and
     the rest on the CPU), so there is no pack, profile or RAM budget to choose."""
     fam = OWN_PATH_FAMILIES[family]
+    if fam.get("cuda_only") and hip:
+        fail(f"{fam['title']} runs on NVIDIA cards only: its engine path (src/glm4) is built for CUDA",
+             "run setup on the NVIDIA PC, or choose another model")
     say()
     say(f"  {fam['title']} - {fam['by']}: {fam['about']}")
     ok(f"model: {fam['title']}")
@@ -8985,7 +9018,9 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     vram_gb = float(gpu.get("vram_gb", 0.0))
     par = getattr(a, "parallel", None)
     par_said = False
-    if par is None and not a.yes:                      # offered, with its price; Enter keeps one at a time (never forced)
+    if not fam.get("parallel", True):
+        par = 1                                        # validated one request at a time (Solar-Open-100B: single-stream)
+    elif par is None and not a.yes:                    # offered, with its price; Enter keeps one at a time (never forced)
         say()
         for line in own_path_parallel_note(None, fam, model, vram_gb, ctx):
             say("  " + line)
@@ -9038,7 +9073,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         download(fam["hf"] + gguf.name, gguf)
     verify_sha256(gguf, *fam["sha256"][gguf.name], own=bool(a.gguf_dir))
     ok(f"model file: {gguf}")
-    mmproj = folder / fam["mmproj"]
+    mmproj = folder / fam["mmproj"] if fam.get("mmproj") else None
     if vision != "none":                               # the image encoder: Unsloth's mmproj, pinned, size + SHA-256 checked
         if not a.gguf_dir and not have(mmproj) and not mmproj.with_name(mmproj.name + ".part").exists():
             # another size of this model has it already (the same file, kept beside each size): linked here, not fetched again
@@ -9071,6 +9106,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     cfg = {"exe": engine_exe(eng), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": f"{fam['name']}-{model.lower()}", "arch": fam["arch"],
            "log": str(home() / f"strata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
+    cfg.update(fam.get("config") or {})            # the family's own defaults (Solar: reasoning_effort minimal)
     if cuda_tk == 12:
         cfg["cuda"] = 12
     if hip:
@@ -10950,8 +10986,10 @@ def main() -> int:
             say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else "")
                 + family_menu_note(f, hip, gpu, avx2, avx512)
                 + (f"   (recommended for Strix Halo: {STRIX_HALO_MODEL})" if f == rec_fam and rec_fam != fams[0] else ""))
-        rest = [*(f for f in OWN_PATH_FAMILIES if not OWN_PATH_FAMILIES[f].get("feed")), *MULTI_FILE_FAMILIES,
-                *(f for f in OWN_PATH_FAMILIES if OWN_PATH_FAMILIES[f].get("feed")), *feed_late]
+        rest = [*(f for f in OWN_PATH_FAMILIES if not OWN_PATH_FAMILIES[f].get("feed")
+                  and not (hip and OWN_PATH_FAMILIES[f].get("cuda_only"))), *MULTI_FILE_FAMILIES,
+                *(f for f in OWN_PATH_FAMILIES if OWN_PATH_FAMILIES[f].get("feed")
+                  and not (hip and OWN_PATH_FAMILIES[f].get("cuda_only"))), *feed_late]
         for j, f in enumerate(rest, len(fams) + 1):    # families with an engine path of their own
             d = {**FAMILIES, **OWN_PATH_FAMILIES, **MULTI_FILE_FAMILIES}[f]
             say(f"  {j}) {d['title']:20s} {d['by']} - {d['about']}   [new]" + (f"   ({FEED_UNAVAILABLE[f]['reason']})" if f in FEED_UNAVAILABLE else ""))

@@ -497,6 +497,34 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata-q36ref src/qwen35/q36ref.cu)
   target_include_directories(strata-q36ref PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata-q36ref PRIVATE strata_kernels strata_warnings ${_strata_gpu_runtime_target})
+  # SOLAR_PORT.md M1: Solar-Open-100B's reference path (glm4moe, one GPU, the model resident), on Strata's i-quant
+  # MMVQ; checked against llama.cpp's logits.
+  #
+  # CUDA only, deliberately: the engine keeps the routed experts in mapped pinned HOST memory and copies a miss into a
+  # VRAM LRU from inside a captured graph (cudaHostAllocMapped, a device-side directory and pointer table).  The HIP
+  # compat layer maps the symbols, but that path has never been run on a card, and a build that links it would answer
+  # AMD users with wrong experts instead of telling them the family has no engine here.  Without STRATA_HAVE_GLM4 a
+  # glm4moe file is refused by name (model_family_not_supported) and the Qwen families are untouched.
+  if(STRATA_ENABLE_CUDA)
+  add_executable(strata-glm4ref src/glm4/glm4ref.cu)
+  target_include_directories(strata-glm4ref PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+  target_link_libraries(strata-glm4ref PRIVATE strata_kernels strata_warnings ${_strata_gpu_runtime_target})
+  # the engine path for the same family (prompt chunks, KV cache, sessions, serve protocol): src/glm4/glm4_engine.cu,
+  # a library that `strata` switches to for a glm4moe model (the family switch at the top of its main) and that
+  # strata-glm4 wraps on its own.
+  add_library(strata_glm4 STATIC src/glm4/glm4_engine.cu)
+  target_include_directories(strata_glm4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata_glm4 PRIVATE strata_kernels strata_warnings ${_strata_gpu_runtime_target})
+  # what one i-quant matvec costs at Solar's expert shapes (4096x1280, 1..8 columns)
+  add_executable(glm4_mmvq_bench tools/glm4/mmvq_bench.cpp)
+  target_include_directories(glm4_mmvq_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(glm4_mmvq_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_executable(strata-glm4 src/glm4/glm4_main.cpp)
+  strata_utf8_manifest(strata-glm4)
+  target_link_libraries(strata-glm4 PRIVATE strata_glm4 ${_strata_gpu_runtime_target})
+  target_link_libraries(strata PRIVATE strata_glm4)
+  target_compile_definitions(strata PRIVATE STRATA_HAVE_GLM4=1)
+  endif()
   # the engine path for the same family (serve protocol, prompt chunks, decode graph): src/qwen35/q36_engine.cu, a
   # library that `strata` switches to for a qwen35moe model (the family switch at the top of its main) and that
   # strata-q36 wraps on its own.  Not on gfx906 (#3172, #3271): it calls cuBLAS entry points the wave64 compat layer does

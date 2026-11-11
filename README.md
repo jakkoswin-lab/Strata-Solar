@@ -25,6 +25,10 @@
 
 **Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
 
+> **This fork** adds Solar-Open-100B (Upstage, 100B mixture of experts on the `glm4moe` GGUF architecture):
+> its engine path (`src/glm4`), the tokenizer and chat-template support in `serve`, and a setup/model-menu entry.
+> Measurements, limits and the port's own log: [docs/SOLAR_PORT.md](docs/SOLAR_PORT.md).
+
 ## Models
 
 We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where a compatible model fits.
@@ -49,6 +53,17 @@ We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where 
 **Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0. These are the currently documented packs for this model.
 
 [Model guide and compatibility](docs/QWEN36.md).
+
+</details>
+
+<details>
+<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Solar-Open-100B</b></summary>
+
+**Upstage** (Korean and English, 128K context): mradermacher's i1 IQ3_XXS (39.7 GB). 100B parameters, 8 active per
+token. NVIDIA only, one request at a time; the experts stay in RAM (48 GB planned) and are copied into VRAM as each
+token's routing asks. A whole chapter through the API took 63 s on an RTX 5060 Ti.
+
+[Model guide, memory and speed](docs/MODELS.md#solar-open-100b).
 
 </details>
 

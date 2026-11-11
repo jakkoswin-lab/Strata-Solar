@@ -46,6 +46,7 @@ They are estimates; a given context may still not fit.
 - **Less memory, general use:** compare Unsloth, then [Gyro](#gyro-s-and-gyro-m-agentionai), which uses the least memory and is slower.
 - **More memory:** [Unsloth's 4 to 8 bit files](#unsloths-files-ud-iq4_xs-to-q8_0) need 72 to 136 GB for all experts in RAM.
 - **A smaller model:** [Qwen3.6-35B-A3B](#qwen36-35b-a3b), 32 to 52 GB of RAM.
+- **Korean and English, 100B:** [Solar-Open-100B](#solar-open-100b), 40 GB on disk and 48 GB of RAM, NVIDIA cards.
 - **A very large model:** [DeepSeek V4.1-Flash](#deepseek-v41-flash), 12 GB graphics card, 46 to 64 GB of RAM and 257 GB of disk.
 
 If RAM is short, setup can read experts from the SSD instead ([below](#will-it-fit)). That works and is much slower.
@@ -290,6 +291,41 @@ Pictures, parallel requests, full measurements and limits: [QWEN36.md](QWEN36.md
 ```sh
 strata launch --family qwen36 --model UD-Q4_K_XL
 ```
+
+## Solar-Open-100B
+
+[Upstage's Solar-Open-100B](https://huggingface.co/upstage/Solar-Open-100B): 100 billion parameters, 8 active per
+token (128 experts), 128K context, trained for Korean and English. Strata runs
+[mradermacher's i1 IQ3_XXS](https://huggingface.co/mradermacher/Solar-Open-100B-i1-GGUF) on its own engine path,
+chosen by the file. It is in the app's model list and in setup (`--family solar`). **NVIDIA only**: the engine keeps
+the 34.45 GiB of routed experts in pinned host memory and copies a VRAM cache full from a captured graph, and that
+path has only run on NVIDIA cards. One request at a time.
+
+| Size | File | RAM setup plans for | In plain words |
+| --- | ---: | ---: | --- |
+| **IQ3_XXS** | 39.7 GB | 48 GB | 3-bit i-quant (i1, imatrix): the size this engine path was measured with |
+
+`IQ3_XXS` is the only size offered: `IQ2_XXS` measured 0.44-0.48 bits worse per token and looped on a Chinese prompt,
+and the 4-bit files no longer fit the experts in RAM on a machine that pins them. No picture reader, no parallel
+slots on this path.
+
+**Measured on:** RTX 5060 Ti (16 GB), 64 GB of RAM, the file on an NVMe, IQ3_XXS.
+
+| | |
+| --- | ---: |
+| Prompt (2,502 tokens) | 16.4 s (152 tokens/s) |
+| Decode | 33.9 tokens/s |
+| One chapter (2,502 in, 1,587 out, through the API) | 63.3 s |
+
+The context is 128K (192 KiB of KV cache per token, about 1.5 GiB at 8K). The engine needs an NVMe for the weights: a
+5.7 MiB random read took 44.6 ms on a 5400 rpm disk. A machine with less than 48 GB of RAM is warned before the
+download; the engine then keeps the file in the page cache instead of pinning it.
+
+```sh
+strata launch --family solar --model IQ3_XXS
+```
+
+Details, the port's measurements and what was tried and rejected: [SOLAR_PORT.md](SOLAR_PORT.md).
 
 ## Adding or switching models
 

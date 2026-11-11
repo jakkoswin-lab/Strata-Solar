@@ -80,6 +80,8 @@ class EveryFileIsPinned(unittest.TestCase):
 
     def test_the_picture_reader_of_every_family(self):
         for name, fam in {**setup.FAMILIES, **setup.OWN_PATH_FAMILIES}.items():
+            if not fam.get("mmproj"):
+                continue                                 # Solar-Open-100B: text only, no picture file to pin
             with self.subTest(family=name):
                 self.pinned(fam["mmproj_hf"] + fam["mmproj"])
 
