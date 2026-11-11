@@ -1,0 +1,24 @@
+{
+  "exe": "D:\\Strata-solar\\build-ninja\\strata.exe",
+  "args": [
+    "--model",
+    "C:\\models\\solar\\Solar-Open-100B.i1-IQ3_XXS.gguf",
+    "--max-context",
+    "8192",
+    "--chunk",
+    "512"
+  ],
+  "cwd": "D:\\Strata-solar",
+  "tokenizer": "C:\\models\\solar\\tokenizer",
+  "model_name": "solar-open-100b-iq3_xxs",
+  "arch": "glm4moe",
+  "reasoning_effort": "minimal",
+  "max_tokens": 2048,
+  "log": "C:\\models\\solar\\serve.log",
+  "lib_dirs": [
+    "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.4\\bin\\x64"
+  ],
+  "port": 8848,
+  "gpu": 0,
+  "gpus_asked": true
+}
