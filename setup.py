@@ -242,17 +242,16 @@ HF = hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF")
 LLAMA_CPP_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
 LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMIT}.zip"
 
-# The ready-made engine: <PREBUILT_URL><asset>, a zip with strata(.exe), strata-vision(.exe) and BUILD.json, built
-# by tools/make_release.py.  Set this to the GitHub release download folder when publishing, e.g.
-# "https://github.com/<you>/Strata/releases/latest/download/" (or pass --prebuilt / set STRATA_PREBUILT_URL).
-# With the default, the release of this checkout's own version (PREBUILT_TAG_URL, CMakeLists.txt's version) is
-# tried first and the latest release is the fallback (#214): an older checkout keeps the engine it shipped with.
-PREBUILT_URL = "https://github.com/Niko1221/Strata/releases/latest/download/"
+# The ready-made engine: <PREBUILT_URL><asset>, a zip with strata(.exe), strata-vision(.exe) and BUILD.json.
+# This fork publishes its own: the upstream release binaries have no glm4moe (Solar-Open-100B) path, so setup must
+# take the engine from here.  Only the Windows CUDA 13 asset exists; on Linux (and on a CUDA 12 card) the asset is
+# missing and setup compiles the engine instead, which is what the README says.
+PREBUILT_URL = "https://github.com/jakkoswin-lab/Strata-Solar/releases/latest/download/"
 # The repository the release assets and their SHA-256 come from; `engine_digest` reads the API here even
 # when --prebuilt points the download somewhere else, because the hash is only worth having if it comes
 # from somewhere the download does not.
-REPO = "Niko1221/Strata"
-PREBUILT_TAG_URL = "https://github.com/Niko1221/Strata/releases/download/v{version}/"
+REPO = "jakkoswin-lab/Strata-Solar"
+PREBUILT_TAG_URL = "https://github.com/jakkoswin-lab/Strata-Solar/releases/download/v{version}/"
 PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
