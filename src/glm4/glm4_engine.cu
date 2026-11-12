@@ -370,6 +370,11 @@ __global__ void k_qk_prep_rows(float* qk, const float* v, KT* kc, KT* vc, __half
     __syncthreads();
     const int64_t pos = *pos0p + row;
     const int half = n_rot / 2;
+    // The rotated values go to a second shared row, not back into `buf`: thread i reads buf[i +- half] while thread
+    // i +- half would already be overwriting it, and the scheduler decides which side wins.  That race made the whole
+    // engine differ run to run (measured: ~1e-5 in the hidden state, up to 14 on a single q value, and the router's
+    // top-k flipping on the tie it created).
+    __shared__ float rot[512];
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
         float w = buf[i];
         if (i < n_rot) {
@@ -378,18 +383,18 @@ __global__ void k_qk_prep_rows(float* qk, const float* v, KT* kc, KT* vc, __half
             const float cs = cosf(theta), sn = sinf(theta);
             w = i < half ? buf[i] * cs - buf[i + half] * sn : buf[i - half] * sn + buf[i] * cs;
         }
-        buf[i] = w;
+        rot[i] = w;
     }
     __syncthreads();
     if (isq) {
-        for (int i = threadIdx.x; i < D; i += blockDim.x) qk[((size_t) row * per + head) * D + i] = buf[i];
+        for (int i = threadIdx.x; i < D; i += blockDim.x) qk[((size_t) row * per + head) * D + i] = rot[i];
         return;
     }
-    // one (head, position) row of the cache: quantize buf (K) or the value row (V)
-    auto store = [&](KT* dst, __half* scale, size_t slot) {
+    // one (head, position) row of the cache: quantize rot (K) or the value row (V)
+    auto store = [&](const float* srcp, KT* dst, __half* scale, size_t slot) {
         if constexpr (sizeof(KT) == 1) {
             float amax = 0.f;
-            for (int i = threadIdx.x; i < D; i += blockDim.x) amax = fmaxf(amax, fabsf(buf[i]));
+            for (int i = threadIdx.x; i < D; i += blockDim.x) amax = fmaxf(amax, fabsf(srcp[i]));
             red[threadIdx.x] = amax;
             __syncthreads();
             for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
@@ -397,19 +402,19 @@ __global__ void k_qk_prep_rows(float* qk, const float* v, KT* kc, KT* vc, __half
                 __syncthreads();
             }
             const float sc = red[0] > 0.f ? red[0] / 127.f : 1.f;
-            for (int i = threadIdx.x; i < D; i += blockDim.x) dst[i] = (KT) __float2int_rn(buf[i] / sc);
+            for (int i = threadIdx.x; i < D; i += blockDim.x) dst[i] = (KT) __float2int_rn(srcp[i] / sc);
             if (threadIdx.x == 0) scale[slot] = __float2half(sc);
         } else {
-            for (int i = threadIdx.x; i < D; i += blockDim.x) dst[i] = (KT) __float2half(buf[i]);
+            for (int i = threadIdx.x; i < D; i += blockDim.x) dst[i] = (KT) __float2half(srcp[i]);
         }
     };
     KT* kdst = kc + (((size_t) hkv * ctx + pos) * D);
-    store(kdst, ksc, (size_t) hkv * ctx + pos);
+    store(rot, kdst, ksc, (size_t) hkv * ctx + pos);
     __syncthreads();
     for (int i = threadIdx.x; i < D; i += blockDim.x) buf[i] = v[((size_t) row * HKV + hkv) * D + i];
     __syncthreads();
     KT* vdst = vc + (((size_t) hkv * ctx + pos) * D);
-    store(vdst, vsc, (size_t) hkv * ctx + pos);
+    store(buf, vdst, vsc, (size_t) hkv * ctx + pos);
 }
 
 /// Causal attention for row `blockIdx.y` (position pos0 + row) over the cache's positions 0 .. pos0 + row.
@@ -1064,6 +1069,71 @@ bool load(const std::string& path, Model& m, std::string& err) {
 }
 
 // ------------------------------------------------------------------------------------------------ the engine
+/// Argmax of each of `rows` logits rows, for the speculative verify: one block per row, so a whole batch of drafted
+/// tokens is checked with two host round-trips (a kernel launch and an 8-int read) instead of megabytes of logits.
+__global__ void k_argmax_rows(const float* lg, int n_vocab, int* out, int rows) {
+    __shared__ float shv[256];
+    __shared__ int shi[256];
+    const int r = blockIdx.x;
+    const float* p = lg + (size_t) r * n_vocab;
+    float best = -INFINITY;
+    int bi = 0;
+    for (int i = threadIdx.x; i < n_vocab; i += blockDim.x)
+        if (p[i] > best) { best = p[i]; bi = i; }
+    shv[threadIdx.x] = best;
+    shi[threadIdx.x] = bi;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int) threadIdx.x < s) {
+            const float o = shv[threadIdx.x + s];
+            if (o > shv[threadIdx.x]) { shv[threadIdx.x] = o; shi[threadIdx.x] = shi[threadIdx.x + s]; }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[r] = shi[0];
+}
+
+/// The prompt-lookup drafter: no second model, just "where did the last K tokens last occur, and what followed them
+/// there".  Verification is exact (a draft is only kept when the target model's own argmax agrees), so a wrong guess
+/// costs one batched forward and can never change the output.  On Korean translation the repeated material is the
+/// names, the honorific endings and the canned openings, which is what this table finds.
+struct Lookup {
+    static constexpr int K = 4;   // 4-gram: specific enough that most lookups hit the same phrase
+    std::unordered_map<uint64_t, int32_t> last;   // hash of the K tokens ending at i -> i (the index of the next token)
+    std::vector<int32_t> hist;
+
+    static uint64_t hash_of(const int32_t* t, int k) {
+        uint64_t h = 1469598103934665603ull;
+        for (int i = 0; i < k; ++i) {
+            h ^= (uint64_t) (uint32_t) t[i];
+            h *= 1099511628211ull;
+        }
+        return h;
+    }
+    /// Start from `ids`: every K-gram in it points at the token that followed it.
+    void seed(const std::vector<int32_t>& ids) {
+        hist = ids;
+        last.clear();
+        last.reserve(ids.size());
+        for (size_t i = K; i <= hist.size(); ++i) last[hash_of(hist.data() + i - K, K)] = (int32_t) i;
+    }
+    void push(int32_t t) {
+        hist.push_back(t);
+        const size_t n = hist.size();
+        if (n >= (size_t) K) last[hash_of(hist.data() + n - K, K)] = (int32_t) n;
+    }
+    /// Up to `m` tokens that followed the most recent occurrence of the current K-gram; 0 when it never occurred.
+    int draft(int32_t* out, int m) const {
+        if (hist.size() < (size_t) K) return 0;
+        const auto it = last.find(hash_of(hist.data() + hist.size() - K, K));
+        if (it == last.end()) return 0;
+        const size_t j = (size_t) it->second;
+        int n = 0;
+        while (n < m && j + (size_t) n < hist.size()) out[n] = hist[j + (size_t) n], ++n;
+        return n;
+    }
+};
+
 float* dalloc(size_t n) {
     float* p = nullptr;
     CK(cudaMalloc(&p, n * 4));
@@ -1127,6 +1197,11 @@ struct Engine {
     bool fetch_split = true;
     bool graph_enabled = false;
     bool capturing = false;
+    // speculative verify: forward_body leaves one logits row per position instead of moving the last row to row 0
+    bool keep_rows = false;
+    int32_t* d_pick = nullptr;
+    bool spec_on = false;     // STRATA_GLM4_LOOKUP: prompt-lookup speculative decode (greedy requests)
+    int spec_drafts = 4;      // tokens drafted per step
     cudaGraphExec_t gexec = nullptr;
     int graph_sess = -1;
     int64_t* d_pos = nullptr;
@@ -1318,6 +1393,15 @@ struct Engine {
             att_flash = true;
         }
         prof = std::getenv("STRATA_GLM4_PROF") != nullptr;
+        // STRATA_GLM4_LOOKUP: draft decode tokens from the prompt itself (see Lookup) and verify a whole batch in one
+        // forward.  The value is the number of drafts (default 4, at most 6 - the logits buffer holds 8 rows and a
+        // step feeds the current token plus its drafts).  Greedy requests only: a sampler with a temperature or a
+        // penalty has no "did the model agree" test, so they keep the plain loop.
+        if (const char* lk = std::getenv("STRATA_GLM4_LOOKUP")) {
+            const int v = std::atoi(lk);
+            spec_drafts = v > 1 ? std::min(v, 6) : 4;
+            spec_on = true;
+        }
         if (const char* sp = std::getenv("STRATA_GLM4_ATTN_SPLITS")) att_splits = std::max(1, std::atoi(sp));
         if (const char* am = std::getenv("STRATA_GLM4_ATTN")) {
             const std::string v(am);
@@ -1353,6 +1437,7 @@ struct Engine {
         sy = dalloc(T * N);
         wts = dalloc(T * Kp);
         logits = dalloc((size_t) 8 * g.n_vocab);
+        d_pick = dalloc_t<int32_t>(8);   // the speculative verify's per-row argmax
         CK(cudaMalloc(&q8, q8_bytes((int64_t) (T * N + N)) + 4096));
         CK(cudaMalloc(&q8d, q8_bytes((int64_t) T * Kp * FF) + 4096));
         if (m->experts_host) {
@@ -1733,15 +1818,34 @@ struct Engine {
         if (m->experts_host && xc_slots && n > 1) host_cache_from_device();
         if (routecheck_left == 0 && std::getenv("STRATA_GLM4_ROUTECHECK")) routecheck_left = (int) m->layers.size();
         const bool need_ids = !(m->experts_host && n == 1 && dev_cache);
+        // STRATA_GLM4_DUMP_X=<prefix>: raw floats of the stages of layer 0, so two runs can be diffed to the step
+        // that first disagrees.
+        const char* dpx = std::getenv("STRATA_GLM4_DUMP_X");
+        int64_t dpx_layer = 0;
+        auto dump_t = [&](const char* tag, const void* p, size_t elems) {
+            if (!dpx || capturing || dpx_layer != 0) return;
+            std::vector<float> hh(elems);
+            CK(cudaMemcpyAsync(hh.data(), p, elems * 4, cudaMemcpyDeviceToHost, st));
+            CK(cudaStreamSynchronize(st));
+            char path[1024];
+            std::snprintf(path, sizeof path, "%s_%s_%lld.bin", dpx, tag, (long long) dpx_layer);
+            if (FILE* f = std::fopen(path, "wb")) {
+                std::fwrite(hh.data(), 4, elems, f);
+                std::fclose(f);
+            }
+        };
         mark();
         CK(cudaMemcpyAsync(tok, toks, (size_t) n * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(d_pos, &pos_stage, 8, cudaMemcpyHostToDevice, st));
         strata::kernels::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok, n, N, x, st);
         mark();
+        dump_t("emb", x, (size_t) n * N);
         for (int64_t l = 0; l < (int64_t) m->layers.size(); ++l) {
             if (dbg) std::fprintf(stderr, "glm4: layer %lld attn\n", (long long) l);
+            dpx_layer = l;
             const Layer& L = m->layers[(size_t) l];
             k_rms_rows<<<n, kThreads, 0, st>>>(x, L.attn_norm, h, N, m->eps);
+            dump_t("norm", h, (size_t) n * N);
             if (L.qk_merged) {
                 mm(L.qk, h, qkf, n);   // q and k in one launch: the packed matrix is (H + HKV) * D rows
             } else {
@@ -1754,6 +1858,7 @@ struct Engine {
                                              qkf + (size_t) c * qt + H * D, N, HKV * D, 1, st);
                 }
             }
+            dump_t("qkr", qkf, (size_t) n * (H + HKV) * D);
             mm(L.wv, h, vx, n);
             if (kv_i8)
                 k_qk_prep_rows<int8_t><<<(unsigned) (n * (H + HKV)), kThreads, 0, st>>>(
@@ -1763,6 +1868,7 @@ struct Engine {
                 k_qk_prep_rows<__half><<<(unsigned) (n * (H + HKV)), kThreads, 0, st>>>(
                     qkf, vx, (__half*) kc[(size_t) l], (__half*) vc[(size_t) l], nullptr, nullptr,
                     H, HKV, D, m->n_rot, d_pos, ctx, m->rope_base);
+            dump_t("qk", qkf, (size_t) n * (H + HKV) * D);
             if ((force_gemm || att_gemm || pos0 + 1 >= att_thresh) && n == 1 && D == 128 && HKV > 0 && H / HKV == 8) {
                 // GEMM-style decode attention: K / V are read once for the 8 heads that share a KV head
                 const int tiles = att_tiles, nsplits = att_nsplits;
@@ -1821,8 +1927,35 @@ struct Engine {
                              h[1], h[2]);
             }
             mm(L.wo, att, y, n);
+            dump_t("attn", att, (size_t) n * H * D);
+            dump_t("wo", y, (size_t) n * N);
             k_add_rows<<<(unsigned) ((n * N + 255) / 256), 256, 0, st>>>(x, y, n * N);
             mark();
+            // STRATA_GLM4_LAYER_SUM: a checksum of the hidden state after the attention residual and after the MoE
+            // residual, so two runs can be diffed to the first layer that disagrees.
+            const bool lsum = std::getenv("STRATA_GLM4_LAYER_SUM") != nullptr;
+            auto dump_sum = [&](const char* tag) {
+                if (!lsum || capturing) return;   // a sync inside the graph capture is illegal
+                std::vector<float> hh((size_t) n * N);
+                CK(cudaMemcpyAsync(hh.data(), x, hh.size() * 4, cudaMemcpyDeviceToHost, st));
+                CK(cudaStreamSynchronize(st));
+                double s = 0, sa = 0;
+                float mx = 0;
+                for (float v : hh) { s += v; sa += std::fabs(v); mx = std::max(mx, std::fabs(v)); }
+                std::fprintf(stderr, "lsum %s %lld %.6f %.6f %.6g\n", tag, (long long) l, s, sa, mx);
+                // STRATA_GLM4_DUMP_X=<prefix>: the whole hidden state of the first layers, for an element-wise diff
+                if (const char* dx = std::getenv("STRATA_GLM4_DUMP_X")) {
+                    if (l < 3) {
+                        char path[1024];
+                        std::snprintf(path, sizeof path, "%s_%s_%lld.bin", dx, tag, (long long) l);
+                        if (FILE* f = std::fopen(path, "wb")) {
+                            std::fwrite(hh.data(), 4, hh.size(), f);
+                            std::fclose(f);
+                        }
+                    }
+                }
+            };
+            dump_sum("att");
             auto dbgstep = [&](const char* what) {
                 if (!dbg) return;
                 CK(cudaStreamSynchronize(st));
@@ -2120,6 +2253,7 @@ struct Engine {
             dbgstep("shared");
             k_moe_sum_rows<<<dim3((unsigned) ((N + 255) / 256), n), 256, 0, st>>>(x, ey, wts, Kp, sy, N);
             mark();
+            dump_sum("moe");
             dbgstep("sum");
         }
         k_rms_rows<<<n, kThreads, 0, st>>>(x, m->out_norm, h, N, m->eps);
@@ -2129,7 +2263,8 @@ struct Engine {
                 strata::kernels::iq_mmvq(m->head.type, m->head.d, (const char*) q8 + (size_t) c * qb,
                                          logits + (size_t) c * g.n_vocab, N, (int) g.n_vocab, 1, st);
             // the calls above leave one row per position; greedy() / host_logits() want the LAST position in row 0
-            if (n > 1)
+            // (the speculative verify wants every row, so it sets keep_rows and reads them through pick_rows())
+            if (n > 1 && !keep_rows)
                 CK(cudaMemcpyAsync(logits, logits + (size_t) (n - 1) * g.n_vocab, (size_t) g.n_vocab * 4,
                                    cudaMemcpyDeviceToDevice, st));
         } else {
@@ -2207,6 +2342,13 @@ struct Engine {
         std::vector<float> lg;
         host_logits(lg);
         return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+    }
+
+    /// Argmax of the first `count` logits rows (the speculative verify; forward_body's keep_rows left them in place).
+    void pick_rows(int count, int32_t* out) {
+        k_argmax_rows<<<count, 256, 0, st>>>(logits, (int) m->g.n_vocab, d_pick, count);
+        CK(cudaMemcpyAsync(out, d_pick, (size_t) count * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
     }
 
     /// One token per (slot, token) row, each in its own session: `n` forwards of one token.
@@ -2675,6 +2817,21 @@ struct Serve {
             std::fflush(stdout);
             return;
         }
+        // ------------------------------------------------------- speculative decode (STRATA_GLM4_LOOKUP)
+        // The plain loop forward()s one token per step.  With drafts taken from the prompt itself, one forward of
+        // drafts+1 tokens checks them all at once: the model's own argmax at row r either agrees with draft r (keep
+        // it) or names the right token (emit that, rewind the cache).  The output is the same as the plain loop's,
+        // greedily, up to drafts+1 tokens per step.  A temperature or a penalty has no "the model agreed" test and a
+        // template mask advances per emitted token, so both keep the plain loop.
+        const bool spec = E.spec_on && !smp.needs_logits() && !tmpl.mode && E.n_sess == 1;
+        Lookup look;
+        if (E.spec_on)
+            std::fprintf(stderr, "strata-glm4: lookup: armed=%d drafts=%d greedy=%d tmpl=%d sess=%d\n", (int) spec,
+                         E.spec_drafts, (int) !smp.needs_logits(), (int) tmpl.mode, E.n_sess);
+        const bool lk_dbg = std::getenv("STRATA_GLM4_LOOKUP_DEBUG") != nullptr;
+        int dbg_left = lk_dbg ? 3 : 0;
+        if (spec) look.seed(ids);
+        long long spec_steps = 0, spec_offered = 0, spec_taken = 0;
         for (;;) {
             if (smp.needs_logits() || tmpl.mode) {
                 E.host_logits(lg);
@@ -2695,11 +2852,66 @@ struct Serve {
             if (!emit(nx)) break;
             if (n_active > 0) window();
             if (E.pos + 1 > E.ctx) break;
-            const int32_t one = nx;
-            E.process(&one, 1, [](int64_t) { return true; });
+            if (!spec) {
+                const int32_t one = nx;
+                E.process(&one, 1, [](int64_t) { return true; });
+                ss.live.push_back(nx);
+                if (!smp.needs_logits() && !tmpl.mode) nx = E.greedy();
+                continue;
+            }
             ss.live.push_back(nx);
-            if (!smp.needs_logits() && !tmpl.mode) nx = E.greedy();
+            look.push(nx);
+            int32_t draft[8];
+            int m = look.draft(draft, E.spec_drafts);
+            const int64_t room = (int64_t) E.ctx - E.pos;   // positions P .. P+ctx-1 are free; the batch is m+1 of them
+            if (m > room - 1) m = (int) std::max<int64_t>(0, room - 1);
+            if (m <= 0) {
+                const int32_t one = nx;
+                E.process(&one, 1, [](int64_t) { return true; });
+                nx = E.greedy();
+                continue;
+            }
+            int32_t batch[8];
+            batch[0] = nx;
+            for (int i = 0; i < m; ++i) batch[1 + i] = draft[i];
+            const int64_t P = E.pos;
+            E.keep_rows = true;
+            E.forward(batch, m + 1, P);
+            E.keep_rows = false;
+            int32_t pick[8];
+            E.pick_rows(m + 1, pick);
+            if (dbg_left > 0) {
+                --dbg_left;
+                std::fprintf(stderr, "strata-glm4: lookup step P=%lld nx=%d m=%d batch=[", (long long) P, nx, m);
+                for (int i = 0; i <= m; ++i) std::fprintf(stderr, "%s%d", i ? "," : "", batch[i]);
+                std::fprintf(stderr, "] pick=[");
+                for (int i = 0; i <= m; ++i) std::fprintf(stderr, "%s%d", i ? "," : "", pick[i]);
+                std::fprintf(stderr, "]\n");
+            }
+            int ok = 0;
+            while (ok < m && pick[ok] == batch[1 + ok]) ++ok;
+            ++spec_steps;
+            spec_offered += m;
+            spec_taken += ok;
+            int pushed = 0;
+            bool cut = false;
+            for (int i = 0; i < ok; ++i) {
+                if (!emit(draft[i])) { cut = true; break; }   // the token was printed, so it is not fed back (as below)
+                ss.live.push_back(draft[i]);
+                look.push(draft[i]);
+                ++pushed;
+            }
+            E.pos = P + pushed + 1;   // nx at P, the kept drafts at P+1 .. P+pushed
+            E.sess[(size_t) E.cur].pos = E.pos;
+            if (cut) break;           // an accepted draft ended the reply
+            nx = pick[ok];             // the disagreement's token, or the free one when every draft agreed
         }
+        if (spec_steps > 0)
+            std::fprintf(stderr,
+                         "strata-glm4: lookup: %lld steps x %d drafts, %lld accepted (%.0f%%), %.2f tokens/step\n",
+                         spec_steps, E.spec_drafts, spec_taken,
+                         100.0 * (double) spec_taken / (double) std::max(1LL, spec_offered),
+                         1.0 + (double) spec_taken / (double) spec_steps);
         E.sess[(size_t) E.cur].pos = E.pos;
         const double decode_ms = ms_since(d0);
         std::printf("DONE %lld %zu %.1f %.1f %s 0\n", produced, ids.size(), prompt_ms, decode_ms, finish);
@@ -2893,6 +3105,27 @@ int strata::glm4::run(int argc, char** argv) {
     const auto t0 = Clock::now();
     E.process(prompt.data(), (int64_t) prompt.size(), [](int64_t) { return true; });
     const double pp_ms = ms_since(t0);
+    // STRATA_GLM4_SELFCHECK=1: run the same prompt through the engine twice in ONE process and compare the logits.
+    // Equal here but different across processes would mean state that starts out different (uninitialised memory);
+    // unequal here means the same input does not reproduce within a process either.
+    if (std::getenv("STRATA_GLM4_SELFCHECK")) {
+        std::vector<float> l1, l2;
+        E.host_logits(l1);
+        const auto t2 = Clock::now();
+        E.reset();
+        E.process(prompt.data(), (int64_t) prompt.size(), [](int64_t) { return true; });
+        E.host_logits(l2);
+        double mx = 0, rms = 0;
+        size_t nz = 0;
+        for (size_t i = 0; i < l1.size(); ++i) {
+            const double d = std::fabs((double) l1[i] - (double) l2[i]);
+            mx = std::max(mx, d);
+            rms += d * d;
+            if (d > 0) ++nz;
+        }
+        std::fprintf(stderr, "selfcheck: %.6f s, max|d| %.6g, rms %.6g, differing %zu of %zu\n", ms_since(t2) / 1000.0,
+                     mx, std::sqrt(rms / (double) std::max<size_t>(1, l1.size())), nz, l1.size());
+    }
     const auto t1 = Clock::now();
     std::vector<float> lg;
     std::vector<int32_t> gen;
