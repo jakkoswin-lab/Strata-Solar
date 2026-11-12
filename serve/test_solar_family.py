@@ -248,6 +248,26 @@ class ToolNudge(unittest.TestCase):
         self.assertEqual(msgs[1]["content"], "C:\\Translate\\Novel_ForTest 내의 파일 확인 하고 정리해줘")   # a copy
         self.assertEqual(out[0], msgs[0])
 
+    def test_an_empty_xlsx_read_says_how_to_read_it(self):
+        # measured: .xlsx is a zip too, and read returns nothing for it
+        msgs = [{"role": "user", "content": "설정집 확인해줘"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "x1", "type": "function",
+                     "function": {"name": "read", "arguments": json.dumps({"path": "C:\\y\\a.xlsx"})}}]},
+                {"role": "tool", "tool_call_id": "x1", "content": ""}]
+        out = server._solar_tool_nudge(msgs, r"C:\tools\docx_text.py", r"C:\tools\xlsx_text.py")
+        self.assertIn("xlsx_text.py", out[-1]["content"])
+        self.assertIn("shell 도구로", out[-1]["content"])
+
+    def test_a_listing_that_names_a_sheet_points_at_the_reader(self):
+        msgs = [{"role": "user", "content": "확인해줘"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "x2", "type": "function",
+                     "function": {"name": "read", "arguments": json.dumps({"path": "C:\\y"})}}]},
+                {"role": "tool", "tool_call_id": "x2", "content": "설정집_2026.xlsx\n가이드.docx\n"}]
+        out = server._solar_tool_nudge(msgs, r"C:\tools\docx_text.py", r"C:\tools\xlsx_text.py")
+        self.assertIn("xlsx_text.py", out[-1]["content"])
+
     def test_a_docx_task_is_told_how_to_read_it_first(self):
         # measured: pointed at a .docx, the model's first move is `read`, which returns nothing for a zip
         msgs = [{"role": "user", "content": r"C:\x\a.docx 내용을 확인해줘"}]
@@ -315,6 +335,7 @@ class DropSystemPrompt(unittest.TestCase):
         svc = object.__new__(server.Service)
         svc.family, svc.drop_system, svc.effort_end, svc.template = "glm4moe", drop, False, T()
         svc.docx_tool = r"tools\docx_text.py"
+        svc.xlsx_tool = r"tools\xlsx_text.py"
         return svc
 
     def test_with_tools_drops_the_system_turn(self):

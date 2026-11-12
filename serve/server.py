@@ -4922,8 +4922,37 @@ SOLAR_DOCX_NOTE = ("방금 read는 .docx를 읽지 못했습니다(.docx는 압�
                    "지금 바로 shell 도구로 다음 명령을 실행하세요: python {tool} \"<파일.docx>\" --start 1 --lines 200 "
                    "- 계획을 글로 쓰지 말고 바로 호출하세요.")
 SOLAR_DOCX_HINT = ("\n\n.docx는 압축 파일이라 read로 내용이 나오지 않습니다. read 대신 지금 바로 shell 도구로 "
-                   "다음 명령을 실행하세요: python {tool} \"<파일.docx>\" --start 1 --lines 200 - 계획을 글로 쓰지 "
-                   "말고 바로 호출하세요.")
+                   "다음 명령을 실행하세요: python {tool} \"<파일.docx>\" --start 1 --lines 200 "
+                   "- 경로에 한글이 있으면 그대로 쓰지 말고 `*`로 바꿔 쓰세요(예: C:\\Translate\\Novel_ForTest\\2.*\\*.docx). "
+                   "계획을 글로 쓰지 말고 바로 호출하세요.")
+SOLAR_SHEET_NOTE = ("방금 read는 .xlsx를 읽지 못했습니다(엑셀도 압축 파일입니다). 같은 read를 반복하지 말고, 지금 "
+                    "바로 shell 도구로 다음 명령을 실행하세요: python {tool} \"<파일.xlsx>\" --sheet \"<시트명>\" "
+                    "--rows 50 - 계획을 글로 쓰지 말고 바로 호출하세요.")
+SOLAR_SHEET_HINT = ("\n\n.xlsx도 압축 파일이라 read로 내용이 나오지 않습니다. read 대신 지금 바로 shell 도구로 "
+                    "다음 명령을 하나만 실행하세요: python {tool} \"<파일.xlsx>\" --sheet \"<시트명>\" --rows 50 "
+                    "- 경로에 한글이 있으면 그대로 쓰지 말고 `*`로 바꿔 쓰세요(예: C:\\Translate\\Novel_ForTest\\98.*\\*.xlsx). "
+                    "계획을 글로 쓰지 말고 바로 호출하세요.")
+
+
+def _reader_hint(text: str, docx_tool: str, xlsx_tool: str) -> str:
+    """The hint for every .docx / .xlsx the text mentions (a message or a tool result), or ""."""
+    low = (text or "").lower()
+    out = ""
+    if ".docx" in low or ".doc" in low:
+        out += SOLAR_DOCX_HINT.format(tool=docx_tool)
+    if ".xlsx" in low or ".xls" in low:
+        out += SOLAR_SHEET_HINT.format(tool=xlsx_tool)
+    return out
+
+
+def _reader_note(path: str, docx_tool: str, xlsx_tool: str) -> str:
+    """What to do after a read that came back empty: the reader for that file, else the plain empty note."""
+    low = (path or "").lower()
+    if low.endswith((".docx", ".doc")):
+        return SOLAR_DOCX_NOTE.format(tool=docx_tool)
+    if low.endswith((".xlsx", ".xls")):
+        return SOLAR_SHEET_NOTE.format(tool=xlsx_tool)
+    return SOLAR_EMPTY_TOOL
 
 
 def _call_that_made(messages: list[dict], call_id) -> dict | None:
@@ -4945,7 +4974,8 @@ SOLAR_ACTION = re.compile(
     r"|[A-Za-z]:\\|/|\.(py|md|txt|json|toml|ya?ml|docx|gguf|cu|cpp|hpp|js|ts)\b")
 
 
-def _solar_tool_nudge(messages: list[dict], docx_tool: str = r"tools\docx_text.py") -> list[dict]:
+def _solar_tool_nudge(messages: list[dict], docx_tool: str = r"tools\docx_text.py",
+                      xlsx_tool: str = r"tools\xlsx_text.py") -> list[dict]:
     """Solar plans and stops on an indirect task; a direct imperative makes it act (measured).
 
     At the start of a turn the imperative goes into the user message.  After a tool result the model reads the result
@@ -4958,29 +4988,26 @@ def _solar_tool_nudge(messages: list[dict], docx_tool: str = r"tools\docx_text.p
         body = messages[-1].get("content")
         text = body if isinstance(body, str) else "".join(
             p.get("text", "") for p in body or [] if isinstance(p, dict))
+        call = _call_that_made(messages, messages[-1].get("tool_call_id"))
+        target = ""
+        try:
+            args = (call or {}).get("function", {}).get("arguments") or {}
+            if isinstance(args, str):
+                args = json.loads(args)
+            target = str(args.get("path") or "")
+        except (ValueError, TypeError, AttributeError):
+            target = ""
         # A failed command: measured in OpenCode, Solar re-ran `dir /s /b *.txt` four times against PowerShell, so
         # the "continue" turn says to read the error and change the command instead.
         if SOLAR_TOOL_ERROR.search(text or ""):
-            note = SOLAR_AFTER_TOOL_ERROR
+            note = SOLAR_AFTER_TOOL_ERROR + _reader_hint(target, docx_tool, xlsx_tool)
         elif not (text or "").strip():
             # Measured: `.docx` is a zip, OpenCode's read returns nothing, and the model re-ran read on it three
             # times.  The empty result itself is the moment to say what to do instead.
-            call = _call_that_made(messages, messages[-1].get("tool_call_id"))
-            target = ""
-            try:
-                args = (call or {}).get("function", {}).get("arguments") or {}
-                if isinstance(args, str):
-                    args = json.loads(args)
-                target = str(args.get("path") or "")
-            except (ValueError, TypeError, AttributeError):
-                target = ""
-            note = (SOLAR_DOCX_NOTE.format(tool=docx_tool) if target.lower().endswith((".docx", ".doc"))
-                    else SOLAR_EMPTY_TOOL)
+            note = _reader_note(target, docx_tool, xlsx_tool)
         else:
-            note = SOLAR_AFTER_TOOL
-            if ".docx" in (text or "").lower() or ".doc" in (text or "").lower():
-                # measured: a folder listing that names a .docx is followed by `read` on it, which returns nothing
-                note += SOLAR_DOCX_HINT.format(tool=docx_tool)
+            # measured: a folder listing that names a .docx/.xlsx is followed by `read` on it, which returns nothing
+            note = SOLAR_AFTER_TOOL + _reader_hint(text, docx_tool, xlsx_tool)
         return [*messages, {"role": "user", "content": note}]
     if role != "user":
         return messages
@@ -4996,9 +5023,8 @@ def _solar_tool_nudge(messages: list[dict], docx_tool: str = r"tools\docx_text.p
     if not SOLAR_ACTION.search(text or ""):
         return messages
     nudge = SOLAR_TOOL_NUDGE
-    if ".docx" in (text or "").lower() or ".doc" in (text or "").lower():
-        # measured: pointed at a .docx, the model's first move is `read`, which returns nothing for a zip
-        nudge += SOLAR_DOCX_HINT.format(tool=docx_tool)
+    # measured: pointed at a .docx/.xlsx, the model's first move is `read`, which returns nothing for a zip
+    nudge += _reader_hint(text, docx_tool, xlsx_tool)
     out = list(messages)
     out[-1] = {**messages[-1], "content": (text or "") + nudge}
     return out
@@ -5023,6 +5049,7 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.drop_system = False                      # the config's "drop_system_prompt" (Solar: see render_prompt)
         self.docx_tool = r"tools\docx_text.py"        # the config's "docx_text_tool": what an empty .docx read is told to run
+        self.xlsx_tool = r"tools\xlsx_text.py"        # the config's "xlsx_text_tool": the same for .xlsx
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
@@ -6066,7 +6093,7 @@ class Service:
                 messages = [m for m in messages if m.get("role") != "system"]
             if tools:
                 # Solar plans and stops on an indirect task; the imperative in the user message makes it act first.
-                messages = _solar_tool_nudge(messages, self.docx_tool)
+                messages = _solar_tool_nudge(messages, self.docx_tool, self.xlsx_tool)
                 # Its template reads the OpenAI tool shape (`tool.function` in its tool block, `tool_call.function` in
                 # the history); the server keeps functions flattened for the parsers and the other families.
                 tools = [{"type": "function", "function": t} for t in tools]
@@ -10605,6 +10632,8 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
               " (drop_system_prompt in the config)", flush=True)
     if isinstance(cfg.get("docx_text_tool"), str) and cfg["docx_text_tool"]:
         svc.docx_tool = cfg["docx_text_tool"]           # Solar: the command an empty .docx read is told to run
+    if isinstance(cfg.get("xlsx_text_tool"), str) and cfg["xlsx_text_tool"]:
+        svc.xlsx_tool = cfg["xlsx_text_tool"]           # ... and an empty .xlsx read
     try:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
     except ValueError as e:
