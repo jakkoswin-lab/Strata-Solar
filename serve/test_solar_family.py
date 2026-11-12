@@ -248,6 +248,13 @@ class ToolNudge(unittest.TestCase):
         self.assertEqual(msgs[1]["content"], "C:\\Translate\\Novel_ForTest 내의 파일 확인 하고 정리해줘")   # a copy
         self.assertEqual(out[0], msgs[0])
 
+    def test_a_docx_task_is_told_how_to_read_it_first(self):
+        # measured: pointed at a .docx, the model's first move is `read`, which returns nothing for a zip
+        msgs = [{"role": "user", "content": r"C:\x\a.docx 내용을 확인해줘"}]
+        out = server._solar_tool_nudge(msgs, r"C:\tools\docx_text.py")
+        self.assertIn("docx_text.py", out[-1]["content"])
+        self.assertIn("shell 도구로", out[-1]["content"])
+
     def test_a_tool_result_gets_a_continue_turn(self):
         msgs = [{"role": "user", "content": "x"}, {"role": "tool", "tool_call_id": "a", "content": "sub1/\nsub2/"}]
         out = server._solar_tool_nudge(msgs)
@@ -261,6 +268,27 @@ class ToolNudge(unittest.TestCase):
                  "content": "Get-ChildItem : A positional parameter cannot be found\nExited with code 1"}]
         out = server._solar_tool_nudge(msgs)
         self.assertEqual(out[-1], {"role": "user", "content": server.SOLAR_AFTER_TOOL_ERROR})
+
+    def test_an_empty_docx_read_says_how_to_read_it(self):
+        # measured: .docx is a zip, OpenCode's read returns nothing, and Solar re-ran read three times
+        msgs = [{"role": "user", "content": "확인해줘"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "read", "arguments": json.dumps({"path": "C:\\\\x\\\\a.docx"})}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": ""}]
+        out = server._solar_tool_nudge(msgs)
+        self.assertTrue(out[-1]["content"].startswith("방금 read는"))
+        self.assertIn("docx_text.py", out[-1]["content"])
+        self.assertIn("shell 도구로", out[-1]["content"])
+
+    def test_an_empty_result_of_another_tool_says_it_plainly(self):
+        msgs = [{"role": "user", "content": "확인해줘"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c2", "type": "function",
+                     "function": {"name": "grep", "arguments": json.dumps({"pattern": "x"})}}]},
+                {"role": "tool", "tool_call_id": "c2", "content": "   "}]
+        self.assertEqual(server._solar_tool_nudge(msgs)[-1],
+                         {"role": "user", "content": server.SOLAR_EMPTY_TOOL})
 
     def test_a_compaction_request_gets_the_fill_it_in_nudge(self):
         ask = "You MUST use this format for your response.\n<template>\n## Objective\n- [...]\n## Work State\n- [...]\n</template>"
@@ -286,6 +314,7 @@ class DropSystemPrompt(unittest.TestCase):
                 return json.dumps({"messages": messages, "tools": tools})
         svc = object.__new__(server.Service)
         svc.family, svc.drop_system, svc.effort_end, svc.template = "glm4moe", drop, False, T()
+        svc.docx_tool = r"tools\docx_text.py"
         return svc
 
     def test_with_tools_drops_the_system_turn(self):

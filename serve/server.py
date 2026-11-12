@@ -4916,6 +4916,25 @@ SOLAR_SUMMARY_NUDGE = ("\n\n위 템플릿의 각 항목을 이 대화에서 실�
                        "적으세요.")
 SOLAR_TOOL_ERROR = re.compile(r"Exited with code|not recognized|CommandNotFoundException|ParameterBindingException|"
                               r"Traceback \(most recent|No such file|cannot find the (file|path)", re.I)
+SOLAR_EMPTY_TOOL = ("도구 결과가 비어 있습니다. 같은 호출을 그대로 반복하지 말고 다른 방법을 쓰세요. "
+                    "계획을 글로 쓰지 마세요.")
+SOLAR_DOCX_NOTE = ("방금 read는 .docx를 읽지 못했습니다(.docx는 압축 파일입니다). 같은 read를 반복하지 말고, "
+                   "shell 도구로 다음 명령을 실행하세요: python {tool} \"<파일.docx>\" --start 1 --lines 200")
+SOLAR_DOCX_HINT = ("\n\n.docx는 압축 파일이라 read로 내용이 나오지 않습니다. shell 도구로 다음 명령을 실행하세요: "
+                   "python {tool} \"<파일.docx>\" --start 1 --lines 200")
+
+
+def _call_that_made(messages: list[dict], call_id) -> dict | None:
+    """The tool_call (OpenAI shape) whose id is `call_id`, from the assistant turn that issued it."""
+    if not call_id:
+        return None
+    for m in reversed(messages):
+        if m.get("role") != "assistant":
+            continue
+        for c in m.get("tool_calls") or []:
+            if isinstance(c, dict) and c.get("id") == call_id:
+                return c
+    return None
 # What makes a message "work" rather than a question: an imperative about files or commands, or a path.  Solar writes
 # a plan and ends the turn on an indirect task ("check these files and summarize"); the nudge above makes it call the
 # tool first (measured: 4.1 s, finish=tool_calls, no plan).  A plain question ("hello") is left alone.
@@ -4924,7 +4943,7 @@ SOLAR_ACTION = re.compile(
     r"|[A-Za-z]:\\|/|\.(py|md|txt|json|toml|ya?ml|docx|gguf|cu|cpp|hpp|js|ts)\b")
 
 
-def _solar_tool_nudge(messages: list[dict]) -> list[dict]:
+def _solar_tool_nudge(messages: list[dict], docx_tool: str = r"tools\docx_text.py") -> list[dict]:
     """Solar plans and stops on an indirect task; a direct imperative makes it act (measured).
 
     At the start of a turn the imperative goes into the user message.  After a tool result the model reads the result
@@ -4939,7 +4958,24 @@ def _solar_tool_nudge(messages: list[dict]) -> list[dict]:
             p.get("text", "") for p in body or [] if isinstance(p, dict))
         # A failed command: measured in OpenCode, Solar re-ran `dir /s /b *.txt` four times against PowerShell, so
         # the "continue" turn says to read the error and change the command instead.
-        note = SOLAR_AFTER_TOOL_ERROR if SOLAR_TOOL_ERROR.search(text or "") else SOLAR_AFTER_TOOL
+        if SOLAR_TOOL_ERROR.search(text or ""):
+            note = SOLAR_AFTER_TOOL_ERROR
+        elif not (text or "").strip():
+            # Measured: `.docx` is a zip, OpenCode's read returns nothing, and the model re-ran read on it three
+            # times.  The empty result itself is the moment to say what to do instead.
+            call = _call_that_made(messages, messages[-1].get("tool_call_id"))
+            target = ""
+            try:
+                args = (call or {}).get("function", {}).get("arguments") or {}
+                if isinstance(args, str):
+                    args = json.loads(args)
+                target = str(args.get("path") or "")
+            except (ValueError, TypeError, AttributeError):
+                target = ""
+            note = (SOLAR_DOCX_NOTE.format(tool=docx_tool) if target.lower().endswith((".docx", ".doc"))
+                    else SOLAR_EMPTY_TOOL)
+        else:
+            note = SOLAR_AFTER_TOOL
         return [*messages, {"role": "user", "content": note}]
     if role != "user":
         return messages
@@ -4954,8 +4990,12 @@ def _solar_tool_nudge(messages: list[dict]) -> list[dict]:
         return out
     if not SOLAR_ACTION.search(text or ""):
         return messages
+    nudge = SOLAR_TOOL_NUDGE
+    if ".docx" in (text or "").lower() or ".doc" in (text or "").lower():
+        # measured: pointed at a .docx, the model's first move is `read`, which returns nothing for a zip
+        nudge += SOLAR_DOCX_HINT.format(tool=docx_tool)
     out = list(messages)
-    out[-1] = {**messages[-1], "content": (text or "") + SOLAR_TOOL_NUDGE}
+    out[-1] = {**messages[-1], "content": (text or "") + nudge}
     return out
 
 
@@ -4977,6 +5017,7 @@ class Service:
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.drop_system = False                      # the config's "drop_system_prompt" (Solar: see render_prompt)
+        self.docx_tool = r"tools\docx_text.py"        # the config's "docx_text_tool": what an empty .docx read is told to run
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
@@ -6020,7 +6061,7 @@ class Service:
                 messages = [m for m in messages if m.get("role") != "system"]
             if tools:
                 # Solar plans and stops on an indirect task; the imperative in the user message makes it act first.
-                messages = _solar_tool_nudge(messages)
+                messages = _solar_tool_nudge(messages, self.docx_tool)
                 # Its template reads the OpenAI tool shape (`tool.function` in its tool block, `tool_call.function` in
                 # the history); the server keeps functions flattened for the parsers and the other families.
                 tools = [{"type": "function", "function": t} for t in tools]
@@ -10557,6 +10598,8 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         svc.drop_system = drop
         print(f"[strata] system prompts: {'dropped' if drop is True else 'dropped when the request has tools'}"
               " (drop_system_prompt in the config)", flush=True)
+    if isinstance(cfg.get("docx_text_tool"), str) and cfg["docx_text_tool"]:
+        svc.docx_tool = cfg["docx_text_tool"]           # Solar: the command an empty .docx read is told to run
     try:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
     except ValueError as e:
