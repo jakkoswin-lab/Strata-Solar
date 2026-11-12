@@ -41,8 +41,11 @@ MENU = [8192, 32768, 65536, 131072, 204800, 262144]           # setup's own-path
 # about 1000 of its 5.74 MiB slots).  The engine allocates a session before the cache and the cache takes what is
 # left; a context that leaves the cache nothing runs at 3.5 tok/s, so the recommendation keeps it.  Measured on the
 # 16 GB card: 8192 -> 1,650 slots, 93% hit rate; 128K would need 24 GiB for the cache alone and cannot start.
+# "min_fixed_gb" is the part that has to be there for the engine to start at all (no cache reserve): 32K was measured
+# starting on a 16 GB card with 846 slots (4.74 GiB) and 13-15 tok/s, so a context between the two figures starts,
+# just slower - `warning()` says which of the two it is.
 EXTRA_FAMILIES = {
-    "solar-open-100b": {"bytes_per_token": 48 * 8 * 128 * 2 * 2, "fixed_gb": 5.8 + 5.5},
+    "solar-open-100b": {"bytes_per_token": 48 * 8 * 128 * 2 * 2, "fixed_gb": 5.8 + 5.5, "min_fixed_gb": 5.8},
 }
 
 
@@ -116,6 +119,14 @@ def warning(fit: dict | None, vram_gb: float | None, ctx: int, choices) -> str |
     best = largest_fit(fit, vram_gb, choices)
     if not best or fits(fit, float(vram_gb), int(ctx)):
         return None
+    kv_gib = int(ctx) * float(fit['bytes_per_token']) / GIB
+    floor = float(fit.get("min_fixed_gb") or 0)                # starts without the cache reserve, only slower
+    if floor and kv_gib + floor <= float(vram_gb):
+        want = float(fit["fixed_gb"]) - floor
+        left = float(vram_gb) - kv_gib - floor
+        return (f"At {label(int(ctx))}, this model's conversation memory takes about {kv_gib:.1f} GB of graphics memory, "
+                f"which leaves about {left:.1f} GB of this card's {float(vram_gb):.0f} GB for the expert cache instead of "
+                f"the {want:.1f} GB the measurements used: it starts, and decode is slower. {label(best)} keeps that cache.")
     return (f"At {label(int(ctx))}, this model's conversation memory needs about {int(ctx) * float(fit['bytes_per_token']) / GIB:.1f} GB of graphics memory. With the model "
             f"itself that is more than this card's {float(vram_gb):.0f} GB, so it will probably not start. {label(best)} fits on this card: choose "
             f"{label(best)} or less.")
