@@ -987,6 +987,52 @@ The decode drop is the cache, not the context: doubling the KV takes 3.2 GiB awa
 goes from about 90% to about 70%.  A turn that only adds a tool result still prefills a few hundred tokens (2-3 s),
 which is what keeps the loop usable; the first turn of a session pays the whole 3.4K system prompt.
 
+## How the model calls tools (and why the service parses more than one spelling)
+
+Solar's own chat template defines tool use; this is not a convention the port invented.  It renders the tool
+definitions into the system block as
+
+    ## Tools
+    ### Tool Call Instruction
+    ... <|tools:begin|><|tool:begin|><tools-json-object><|tool:end|>...<|tools:end|>
+    ### Tool Call Format
+    <|tool_call:begin|><tool-call-id><|tool_call:name|><tool-name><|tool_call:args|><args-json-object><|tool_call:end|>
+
+and a tool-call turn as `<|begin|>assistant<|tool_calls|>` + the calls + `<|calls|>` (no `<|end|>`: the calls token
+ends the turn), with results answered as
+
+    <|begin|>tool<|tool_response|><|tool_response:begin|>ID<|tool_response:name|>NAME<|tool_response:result|>RESULT<|tool_response:end|><|end|>
+
+The markers are real control tokens in the tokenizer: `<|begin|>` 20, `<|end|>` 21, `<|think|>` 22,
+`<|content|>` 23, `<|flush|>` 24, `<|calls|>` 25, `<|tool_calls|>` 30, `<|tool_call:begin|>` 31, `:end` 32,
+`:name` 33, `:args` 34, `<|tool_response:begin|>` 36.  One line of the template's own instructions is wrong: it
+names `<|tool_response:id|>`, and no such token exists - the renderer writes `<|tool_response:begin|>`.  The port
+follows the renderer.
+
+Measured with `STRATA_DEBUG=1` (which prints the raw generated text), a plain system prompt, two tools (shell,
+read), temperature 0:
+
+| request | what the model wrote | time |
+|---|---|---|
+| "check what files are in C:\Translate\Novel_ForTest, call a tool now" | `<|tool_call:begin|>8898888888<|tool_call:name|>shell<|tool_call:args|>{"command": "dir C:\\Translate\\Novel_ForTest"}<|tool_call:end|><|calls|>` | 4.8 s |
+| the same task with a tool result already in the history | `<|tool_call:begin|>a1b2c3d4e6...` - the previous call's id with its last character bumped | 3.2 s |
+| a question, no tools | `안녕하세요! 😊<|begin|>` - the answer, then the next turn's marker instead of `<|flush|>` | 1.1 s |
+
+So the model calls tools natively.  Its ids are ten characters but not random: ten digits (`8898888888`) or the
+previous id with the last character incremented; the service gives each call its own id anyway.
+
+Upstage's own serving does not trust the format to the model.  The vLLM recipe runs `--tool-call-parser solar_open`
+together with `SolarOpenTemplateLogitsProcessor` (Upstage's vLLM fork), which forces the first token to
+`<|content|>` or `<|tool_calls|>`, then `<|tool_call:begin|>` -> id (at most 10 tokens) -> `:name` -> `:args` ->
+`:end` -> another call or `<|calls|>`, and rewrites `<|end|>` to `<|flush|>` inside content.  Our engine has no
+logits processor, so the model is free to leave the format; the leaves measured here were Qwen's
+`<tool_call>name key="value"</tool_call>`, a call with `<|tool_call:name|>` left out, and
+`<tool_call>[execute]</tool_call>` with the payload in a fence after it.  `SolarOutputParser` reads all four, and
+`STRATA_DEBUG=1` prints the raw text when a fifth appears.
+
+The service's marker handling follows the template: `<|content|>`, `<|flush|>`, `<|think|>` and `<|tool_calls|>` are
+dropped, and `<|end|>`, `<|begin|>` and `<|calls|>` stop the reply.
+
 ## Architectures and backends
 
 `cmake/backends/cuda.cmake` defaults a hand build to `120` and warns about it: that is the RTX 50 card this engine
