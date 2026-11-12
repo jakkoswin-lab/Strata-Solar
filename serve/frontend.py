@@ -2186,7 +2186,7 @@ class SolarOutputParser:
                                                  id=cid.strip() or ("call_" + uuid.uuid4().hex[:24])))]
 
     def _emit_call(self, raw: str) -> list:
-        name = self._name.strip()
+        name = self._name.strip().lstrip("=: ").strip()   # measured: a forced call can write "<|tool_call:name|>=shell"
         try:
             args = json.loads(self._args) if self._args.strip() else {}
         except ValueError:

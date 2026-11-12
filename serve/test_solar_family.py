@@ -20,7 +20,8 @@ from serve import frontend                      # noqa: E402
 from serve import server                        # noqa: E402
 
 SOLAR_IDS = {"<|begin|>": 20, "<|end|>": 21, "<|think|>": 22, "<|content|>": 23, "<|flush|>": 24,
-             "<|calls|>": 25, "<|tool_calls|>": 30}
+             "<|calls|>": 25, "<|tool_calls|>": 30, "<|tool_call:begin|>": 31, "<|tool_call:end|>": 32,
+             "<|tool_call:name|>": 33, "<|tool_call:args|>": 34}
 SOLAR_SPECIALS = {"tokenizer.ggml.bos_token_id": 1, "tokenizer.ggml.eos_token_id": 2}
 
 
@@ -74,8 +75,9 @@ class MessageMarkers(unittest.TestCase):
     def test_stop_and_skip_ids(self):
         svc = self._svc()
         server.Service.set_family(svc, "glm4moe")
-        self.assertEqual(svc.stop_ids, {2, 20, 21, 25})   # eos, <|begin|>, <|end|>, <|calls|>
-        self.assertEqual(svc.skip_ids, {22, 23, 24, 30})  # <|think|>, <|content|>, <|flush|>, <|tool_calls|>
+        self.assertEqual(svc.stop_ids, {2, 20, 21, 24, 25})   # eos, <|begin|>, <|end|>, <|flush|>, <|calls|>
+        self.assertEqual(svc.skip_ids, {22, 23, 24, 30})      # <|think|>, <|content|>, <|flush|>, <|tool_calls|>
+        self.assertTrue(svc.tmpl_ids_ok)                      # the mask's hardcoded ids match this tokenizer
         self.assertIs(svc.parser_cls, frontend.SolarOutputParser)
 
     def test_the_family_is_inferred_from_the_tokenizer(self):

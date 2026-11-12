@@ -1712,6 +1712,11 @@ class StrataEngine:
         if isinstance(ik, list) and ik and all(isinstance(k, str) and k and all(c in "0123456789abcdef" for c in k)
                                                for k in ik):
             keys += " img_keys=" + ",".join(ik)
+        # Solar's template mask (include/strata/glm4/tmpl_mask.hpp): 1 content only, 2 content or a tool call.
+        # Absent = no mask, exactly as before.
+        tm = sampling.get("strata_glm4_tmpl")
+        if isinstance(tm, int) and not isinstance(tm, bool) and 1 <= tm <= 3:
+            keys += f" strata_glm4_tmpl={tm}"
         # "strata_prefix" (resolved by Service.resolve_prefix to {"tokens": N}): the first N prompt tokens are a shared
         # prefix - the engine pins the checkpoint there.  Absent or unresolved = as before.
         prefix = sampling.get("strata_prefix")
@@ -5059,6 +5064,7 @@ class Service:
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.undeclared_tool_calls = "text"               # #4622: config "undeclared_tool_calls": "call" hands a call of an undeclared name to the client
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
+        self.tmpl_ids_ok = False                          # Solar: the tokenizer numbers the markers the engine's mask hardcodes
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = end_token_ids(tokenizer)
@@ -5099,7 +5105,14 @@ class Service:
             eos = (getattr(self.tok, "special_ids", None) or {}).get("tokenizer.ggml.eos_token_id", 2)
             self.skip_ids = {int(ids[n]) for n in ("<|content|>", "<|flush|>", "<|think|>", "<|tool_calls|>")
                              if n in ids}
-            self.stop_ids = {int(eos)} | {int(ids[n]) for n in ("<|end|>", "<|begin|>", "<|calls|>") if n in ids}
+            # <|flush|> ends a content turn (the template's own end for one); with the template mask on, it is the
+            # only way out of the content state, so the reply has to stop there.
+            self.stop_ids = {int(eos)} | {int(ids[n]) for n in ("<|end|>", "<|begin|>", "<|calls|>", "<|flush|>")
+                                          if n in ids}
+            self.tmpl_ids_ok = all(int(ids.get(n, -1)) == v for n, v in (
+                ("<|content|>", 23), ("<|flush|>", 24), ("<|calls|>", 25), ("<|tool_calls|>", 30),
+                ("<|tool_call:begin|>", 31), ("<|tool_call:end|>", 32), ("<|tool_call:name|>", 33),
+                ("<|tool_call:args|>", 34)))          # the ids the engine's mask hardcodes
             self.parser_cls = SolarOutputParser
         import serve.frontend as _frontend
         _frontend.use_family(family)
@@ -6120,7 +6133,10 @@ class Service:
                         part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
-        if force and kwargs.get("enable_thinking", True) is False:
+        # Solar's forced call is not written into the prompt: `forced_call` writes another family's format
+        # (<tool_call><function=NAME>), which the model imitates into a broken call.  Its nudge asks for the call
+        # instead (see _run, where the sampler's mask is the family's own enforcement).
+        if force and kwargs.get("enable_thinking", True) is False and self.family != "glm4moe":
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
         self.embeddings.keys = None
@@ -6426,6 +6442,15 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        # Solar's own generation format, enforced at the sampling step (include/strata/glm4/tmpl_mask.hpp): without
+        # it the model may leave its format (<tool_call> XML, a call without <|tool_call:name|>, "[execute]" plus a
+        # fence).  Only in the no-think rendering the template writes (effort minimal/low) - a thinking reply starts
+        # inside <|think|>.  A forced tool_choice loses its prompt opening: `forced_call` writes another family's
+        # format (<tool_call><function=N>), which Solar then imitates into a broken call; the nudge asks for the call
+        # instead, and "required" is honoured as far as the model goes.
+        if self.family == "glm4moe" and self.tmpl_ids_ok and not thinking:
+            sampling = {**(sampling or {}), "strata_glm4_tmpl": 2 if tools else 1}
+            force = None
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:

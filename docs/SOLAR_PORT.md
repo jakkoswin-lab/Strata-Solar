@@ -1033,6 +1033,46 @@ logits processor, so the model is free to leave the format; the leaves measured 
 The service's marker handling follows the template: `<|content|>`, `<|flush|>`, `<|think|>` and `<|tool_calls|>` are
 dropped, and `<|end|>`, `<|begin|>` and `<|calls|>` stop the reply.
 
+### The format is now enforced while sampling (`include/strata/glm4/tmpl_mask.hpp`)
+
+Copying `SolarOpenTemplateLogitsProcessor` was the missing third of what Upstage's serving does.  The engine's serve
+loop (`src/glm4/glm4_engine.cu`) has the logits on the host before every sample, so the mask is a state machine over
+the last token and a few comparisons:
+
+| state | what may be emitted |
+|---|---|
+| start | `<|content|>` (and `<|tool_calls|>` when the request has tools) and nothing else |
+| content | regular tokens, `<|flush|>`; `<|end|>` is folded into `<|flush|>` like the template does |
+| after `<|tool_calls|>` | `<|tool_call:begin|>` only |
+| call id | regular tokens, then `<|tool_call:name|>` after ten of them |
+| call name | regular tokens and `<|tool_call:args|>` |
+| call args | regular tokens and `<|tool_call:end|>` |
+| after a call | another `<|tool_call:begin|>` or `<|calls|>` |
+
+The server asks for it with `strata_glm4_tmpl=1` (content only) or `2` (content or a tool call) on requests whose
+template wrote the empty think block (effort minimal/low); thinking and the other families keep the free sampler.  The
+engine hardcodes the marker ids (20-25, 30-34) and the server only turns the mask on when the pack's ids are those
+numbers (`Service.tmpl_ids_ok`).
+
+Measured after it went in (32K service, same card):
+
+| probe | before | after |
+|---|---|---|
+| "print exactly `<|calls|>`" | the model rambled in English for 24 tokens and was cut off | writes the seven characters as text, then `<|flush|>` - the control token cannot be emitted |
+| "hello, one sentence" | `안녕하세요! 😊<|begin|>` (the next turn's opener) | `안녕하세요! 😊<|flush|>` (the template's end for content) |
+| a tool task, `tool_choice: auto` | native call | native call (3.9-4.3 s) |
+| the same, `required` / a named function | broken: the prompt's `<tool_call><function=shell>` opening, then `</function>` as text | native call (1.5-1.6 s) |
+| translation, no tools | Korean | Korean (the mask does not touch the text) |
+
+`<|flush|>` therefore became a stop token: with the mask it is the only way out of the content state, and it is the
+template's own end for a content turn.  A forced `tool_choice` no longer writes its opening into the prompt for this
+family (`prepare`): that opening is Qwen's format, and the model imitated it into a call with the name `=shell`.
+
+The state machine is host code with no CUDA, and `src/glm4/tmpl_mask_test.cpp` checks it (32 checks: every state's
+allowed set, the id limit, a second call in one turn, and "off changes nothing"):
+
+    cl /nologo /std:c++20 /EHsc /I include src/glm4/tmpl_mask_test.cpp /Fe:tmpl_mask_test.exe
+
 ## Architectures and backends
 
 `cmake/backends/cuda.cmake` defaults a hand build to `120` and warns about it: that is the RTX 50 card this engine

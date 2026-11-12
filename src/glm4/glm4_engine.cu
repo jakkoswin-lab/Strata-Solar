@@ -17,6 +17,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/glm4/engine.hpp"
+#include "strata/glm4/tmpl_mask.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/qwen35/sampling.hpp"
 
@@ -2303,6 +2304,7 @@ struct Slot {
     std::mt19937_64 rng;
     std::vector<int32_t> hist;
     Clock::time_point t0;
+    strata::glm4::Mask tmpl;                 // Solar's generation format, when the request asked for it
 };
 
 struct Serve {
@@ -2348,8 +2350,10 @@ struct Serve {
             Slot& sl = slots[(size_t) b];
             Engine::Sess& ss = E.sess[(size_t) b];
             int y;
-            if (sl.smp.needs_logits()) {
+            if (sl.smp.needs_logits() || sl.tmpl.mode) {
+                strata::glm4::mask(E.row_logits[(size_t) r], sl.tmpl);
                 y = sample(E.row_logits[(size_t) r], sl.smp, sl.hist, sl.rng);
+                strata::glm4::advance(sl.tmpl, y);
             } else {
                 y = E.rows_pick[(size_t) r];
             }
@@ -2426,6 +2430,7 @@ struct Serve {
         }
         const long long max_new = std::strtoll(p, &p, 10);
         Sampling smp;
+        strata::glm4::Mask tmpl;            // the request's template mask, if the server asked for one
         for (;;) {
             while (*p == ' ') ++p;
             const char* st0 = p;
@@ -2444,6 +2449,7 @@ struct Serve {
             else if (key == "penalty_freq") smp.freq = std::strtof(v, nullptr);
             else if (key == "penalty_present") smp.present = std::strtof(v, nullptr);
             else if (key == "seed") smp.seed = std::strtoull(v, nullptr, 10);
+            else if (key == "strata_glm4_tmpl") tmpl.mode = std::atoi(v);
             else { p = const_cast<char*>(st0); break; }
         }
         const std::vector<int32_t> ids = parse_ids(p);
@@ -2521,11 +2527,13 @@ struct Serve {
         const auto d0 = Clock::now();
         long long produced = 0;
         const char* finish = "length";
-        int nx = smp.needs_logits() ? -1 : E.greedy();
+        int nx = smp.needs_logits() || tmpl.mode ? -1 : E.greedy();
         if (adm) {
-            if (smp.needs_logits()) {
+            if (smp.needs_logits() || tmpl.mode) {
                 E.host_logits(lg);
+                strata::glm4::mask(lg, tmpl);
                 nx = sample(lg, smp, hist, rng);
+                strata::glm4::advance(tmpl, nx);
             }
             std::printf("T %d\n", nx);
             ++produced;
@@ -2546,6 +2554,7 @@ struct Serve {
                 sl.rng = rng;
                 sl.hist = hist;
                 sl.t0 = Clock::now();
+                sl.tmpl = tmpl;
                 ss.active = true;
                 ++n_active;
             }
@@ -2554,9 +2563,11 @@ struct Serve {
             return;
         }
         for (;;) {
-            if (smp.needs_logits()) {
+            if (smp.needs_logits() || tmpl.mode) {
                 E.host_logits(lg);
+                strata::glm4::mask(lg, tmpl);
                 nx = sample(lg, smp, hist, rng);
+                strata::glm4::advance(tmpl, nx);
             }
             auto emit = [&](int t) {
                 std::printf("T %d\n", t);
@@ -2574,7 +2585,7 @@ struct Serve {
             const int32_t one = nx;
             E.process(&one, 1, [](int64_t) { return true; });
             ss.live.push_back(nx);
-            if (!smp.needs_logits()) nx = E.greedy();
+            if (!smp.needs_logits() && !tmpl.mode) nx = E.greedy();
         }
         E.sess[(size_t) E.cur].pos = E.pos;
         const double decode_ms = ms_since(d0);
