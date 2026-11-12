@@ -147,6 +147,46 @@ class SolarToolCalls(unittest.TestCase):
         q = frontend.SolarOutputParser(tools=None, declared_only=True)
         self.assertEqual([e.kind for e in q.feed(CALL)], ["content"])
 
+    def test_the_xml_fallback_the_model_drifts_into(self):
+        # measured in OpenCode: `<tool_call>shell cmd="..." workdir="..."</tool_call>` came out as text
+        p = frontend.SolarOutputParser(tools=[{"name": "shell"}])
+        out = p.feed('<tool_call>shell cmd="dir C:\\x" workdir="C:\\x"</tool_call>')
+        calls = [e for e in out if e.kind == "tool_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].call.name, "shell")
+        self.assertEqual(calls[0].call.arguments, {"command": "dir C:\\x", "workdir": "C:\\x"})
+
+    def test_the_xml_function_form(self):
+        p = frontend.SolarOutputParser(tools=[{"name": "shell"}])
+        out = p.feed("<tool_call><function=shell><parameter=command>dir</parameter></function></tool_call>")
+        calls = [e for e in out if e.kind == "tool_call"]
+        self.assertEqual((calls[0].call.name, calls[0].call.arguments), ("shell", {"command": "dir"}))
+
+    def test_xml_split_across_tokens(self):
+        p = frontend.SolarOutputParser(tools=[{"name": "shell"}])
+        out = []
+        for ch in '<tool_call>shell cmd="dir"</tool_call>':
+            out += p.feed(ch)
+        self.assertEqual([e.kind for e in out if e.kind == "tool_call"], ["tool_call"])
+        self.assertEqual("".join(e.text for e in out if e.kind == "content"), "")
+
+    def test_an_unterminated_xml_call_is_text_at_the_end(self):
+        p = frontend.SolarOutputParser(tools=[{"name": "shell"}])
+        self.assertEqual(p.feed('<tool_call>shell cmd="dir"'), [])
+        out = p.finish("stop")
+        self.assertIn("<tool_call>shell", out[0].text)
+
+    def test_a_call_whose_name_marker_is_missing(self):
+        # measured in OpenCode: `<|tool_call:begin|>8888888888>tool<|tool_call:args|>{"command": "read", ...}`
+        p = frontend.SolarOutputParser(tools=[{"name": "read"}])
+        raw = ('<|tool_call:begin|>8888888888>tool<|tool_call:args|>'
+               '{"command": "read", "arguments": {"path": "C:\\\\x\\\\a.docx"}}<|tool_call:end|>')
+        out = p.feed(raw)
+        calls = [e for e in out if e.kind == "tool_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].call.name, "read")
+        self.assertEqual(calls[0].call.arguments, {"path": "C:\\x\\a.docx"})
+
     def test_the_tool_result_ids_reach_the_template(self):
         # Solar's template writes <|tool_response:begin|>ID<|tool_response:name|>NAME; the OpenAI spelling of those
         # fields has to survive openai_to_messages, or every second turn of an agent renders with an empty id/name.
@@ -168,6 +208,13 @@ class ToolNudge(unittest.TestCase):
         self.assertTrue(out[1]["content"].endswith(server.SOLAR_TOOL_NUDGE))
         self.assertEqual(msgs[1]["content"], "C:\\Translate\\Novel_ForTest 내의 파일 확인 하고 정리해줘")   # a copy
         self.assertEqual(out[0], msgs[0])
+
+    def test_a_tool_result_gets_a_continue_turn(self):
+        msgs = [{"role": "user", "content": "x"}, {"role": "tool", "tool_call_id": "a", "content": "sub1/\nsub2/"}]
+        out = server._solar_tool_nudge(msgs)
+        self.assertEqual(len(out), len(msgs) + 1)
+        self.assertEqual(out[-1], {"role": "user", "content": server.SOLAR_AFTER_TOOL})
+        self.assertEqual(out[:-1], msgs)
 
     def test_a_question_is_left_alone(self):
         msgs = [{"role": "user", "content": "안녕, 오늘 기분 어때?"}]

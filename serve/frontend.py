@@ -2133,6 +2133,8 @@ class SolarOutputParser:
     NAME = "<|tool_call:name|>"
     ARGS = "<|tool_call:args|>"
     END = "<|tool_call:end|>"
+    XML_OPEN = "<tool_call>"
+    XML_END = "</tool_call>"
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  recover: bool = False, declared_only: bool = False, deferred: bool = False):
@@ -2159,11 +2161,27 @@ class SolarOutputParser:
 
     @staticmethod
     def _hold(text: str) -> int:
-        """The longest suffix of `text` that is a proper prefix of the opening marker."""
-        for n in range(min(len(text), len(SolarOutputParser.OPEN) - 1), 0, -1):
-            if SolarOutputParser.OPEN.startswith(text[-n:]):
-                return n
-        return 0
+        """The longest suffix of `text` that is a proper prefix of one of the opening markers."""
+        best = 0
+        for marker in (SolarOutputParser.OPEN, SolarOutputParser.XML_OPEN):
+            for n in range(min(len(text), len(marker) - 1), best, -1):
+                if marker.startswith(text[-n:]):
+                    best = n
+                    break
+        return best
+
+    def _accept(self, name: str, args, cid: str, raw: str) -> list:
+        if isinstance(args, dict) and name in ("shell", "bash") and "cmd" in args and "command" not in args:
+            args = dict(args)
+            args["command"] = args.pop("cmd")          # the model's own spelling of the shell tool's field
+        declared = name in self.schemas or self.deferred or (not self.schemas and not self.declared_only)
+        if not isinstance(args, dict) or not declared:
+            self.unread += 1
+            if name:
+                self.unread_names.append(name)
+            return [Event("content", raw)]
+        return [Event("tool_call", call=ToolCall(name=name, arguments=args,
+                                                 id=cid.strip() or ("call_" + uuid.uuid4().hex[:24])))]
 
     def _emit_call(self, raw: str) -> list:
         name = self._name.strip()
@@ -2171,40 +2189,100 @@ class SolarOutputParser:
             args = json.loads(self._args) if self._args.strip() else {}
         except ValueError:
             args = None
-        declared = name in self.schemas or self.deferred or (not self.schemas and not self.declared_only)
-        if not isinstance(args, dict) or not declared:
-            self.unread += 1
-            if name:
-                self.unread_names.append(name)
-            return [Event("content", raw)]
-        cid = self._id.strip() or ("call_" + uuid.uuid4().hex[:24])
-        return [Event("tool_call", call=ToolCall(name=name, arguments=args, id=cid))]
+        # a call whose name marker was left out puts the name in the body: `{"command": "read", "arguments": {...}}`
+        if isinstance(args, dict) and isinstance(args.get("arguments"), dict):
+            guess = str(args.get("command") or args.get("name") or "").strip()
+            if guess in self.schemas:
+                name, args = guess, args["arguments"]
+        return self._accept(name, args, self._id, raw)
+
+    def _emit_xml(self, body: str, raw: str) -> list:
+        """The other spelling the model falls back to: `<tool_call>NAME key="value" ...</tool_call>`, also the
+        `<function=NAME><parameter=key>value</parameter></function>` form."""
+        body = body.strip()
+        name, args = "", {}
+        if body.startswith("<function="):
+            j = body.find(">")
+            name = body[len("<function="):j].strip() if j > 0 else ""
+            for m in re.finditer(r"<parameter=([^>]+)>(.*?)</parameter>", body[j + 1:], re.S):
+                args[m.group(1).strip()] = m.group(2).strip()
+        else:
+            m = re.match(r"([A-Za-z0-9_.:-]+)", body)
+            if not m:
+                return [Event("content", raw)]
+            name = m.group(1)
+            rest = body[m.end():]
+            if rest.lstrip().startswith("{"):
+                try:
+                    obj = json.loads(rest)
+                except ValueError:
+                    obj = None
+                if isinstance(obj, dict) and "name" in obj:
+                    name = str(obj["name"])
+                    args = obj.get("arguments") or obj.get("parameters") or {}
+                elif isinstance(obj, dict):
+                    args = obj
+            else:
+                for am in re.finditer(r'([A-Za-z_][\w.:-]*)\s*=\s*"((?:[^"\\]|\\.)*)"', rest):
+                    try:
+                        args[am.group(1)] = json.loads('"' + am.group(2) + '"')
+                    except ValueError:
+                        args[am.group(1)] = am.group(2)
+                for am in re.finditer(r"([A-Za-z_][\w.:-]*)\s*=\s*'([^']*)'", rest):
+                    args.setdefault(am.group(1), am.group(2))
+        return self._accept(name.strip(), args, "", raw)
 
     def feed(self, delta: str) -> list:
         self.buf += delta
         out: list = []
         while True:
             if self.state == "content":
-                i = self.buf.find(self.OPEN)
-                if i < 0:
+                i_solar = self.buf.find(self.OPEN)
+                i_xml = self.buf.find(self.XML_OPEN)
+                if i_solar < 0 and i_xml < 0:
                     hold = self._hold(self.buf)
                     if len(self.buf) > hold:
                         out.append(Event("content", self.buf[:len(self.buf) - hold]))
                         self.buf = self.buf[len(self.buf) - hold:]
                     return out
+                if i_xml >= 0 and (i_solar < 0 or i_xml < i_solar):
+                    i, marker, nxt = i_xml, self.XML_OPEN, "xml"
+                else:
+                    i, marker, nxt = i_solar, self.OPEN, "call_id"
                 if i:
                     out.append(Event("content", self.buf[:i]))
-                self.buf = self.buf[i + len(self.OPEN):]
-                self._raw, self.state = self.OPEN, "call_id"
+                self.buf = self.buf[i + len(marker):]
+                self._raw, self.state = marker, nxt
                 self._id = self._name = self._args = ""
-            if self.state == "call_id":
-                j = self.buf.find(self.NAME)
+            if self.state == "xml":
+                j = self.buf.find(self.XML_END)
                 if j < 0:
                     return out
-                self._id = self.buf[:j]
-                self._raw += self._id + self.NAME
-                self.buf = self.buf[j + len(self.NAME):]
-                self.state = "call_name"
+                body = self.buf[:j]
+                raw = self._raw + body + self.XML_END
+                self.buf = self.buf[j + len(self.XML_END):]
+                self._raw, self.state = "", "content"
+                out += self._emit_xml(body, raw)
+                continue
+            if self.state == "call_id":
+                j_name = self.buf.find(self.NAME)
+                j_args = self.buf.find(self.ARGS)
+                if j_args >= 0 and (j_name < 0 or j_args < j_name):
+                    # the model left the name marker out: the text before <|tool_call:args|> holds "id>name"
+                    head = self.buf[:j_args]
+                    self._id, sep, self._name = head.rpartition(">")
+                    if not sep:
+                        self._id, self._name = "", head
+                    self._raw += head + self.ARGS
+                    self.buf = self.buf[j_args + len(self.ARGS):]
+                    self.state = "call_args"
+                else:
+                    if j_name < 0:
+                        return out
+                    self._id = self.buf[:j_name]
+                    self._raw += self._id + self.NAME
+                    self.buf = self.buf[j_name + len(self.NAME):]
+                    self.state = "call_name"
             if self.state == "call_name":
                 j = self.buf.find(self.ARGS)
                 if j < 0:
@@ -2226,7 +2304,7 @@ class SolarOutputParser:
     def finish(self, reason: str | None = None) -> list:
         """End of generation: an unterminated call goes out as the text it is."""
         out: list = []
-        if self.state.startswith("call"):
+        if self.state.startswith("call") or self.state == "xml":
             raw, self._raw, self.buf = self._raw + self.buf, "", ""
             self.state = "content"
             if raw:
