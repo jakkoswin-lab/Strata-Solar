@@ -2369,9 +2369,16 @@ struct Serve {
     }
 
     size_t match_len(const Engine::Sess& ss, const std::vector<int32_t>& ids) const {
-        const size_t L = ss.live.size();
-        if (L == 0 || L >= ids.size() || !std::equal(ss.live.begin(), ss.live.end(), ids.begin())) return 0;
-        return L;
+        // The longest prefix of the new prompt this session already holds.  It used to require the WHOLE session
+        // (prompt + the generated tokens) to be a prefix, so a template that re-renders a generated turn differently
+        // from the text the model wrote (Solar writes its calls without the <|tool_calls|> opener the template adds)
+        // forced a full re-read of a 6.5K prompt on every agent turn.  The KV beyond `reuse` is overwritten by the
+        // tokens that follow, so continuing from there is the same computation with less reading.
+        if (ss.live.empty() || ids.size() < 2) return 0;
+        const size_t n = std::min(ss.live.size(), ids.size() - 1);
+        size_t i = 0;
+        while (i < n && ss.live[i] == ids[i]) ++i;
+        return i;
     }
 
     int pick_session(const std::vector<int32_t>& ids) const {
@@ -2469,6 +2476,11 @@ struct Serve {
         if (reuse == 0) {
             E.reset();
             ss.live.clear();
+        } else if (reuse < ss.live.size()) {
+            // the session holds more tokens than the new prompt shares (a template that re-renders the generated text
+            // differently): keep the first `reuse` and continue from there
+            ss.pos = E.pos = (int64_t) reuse;
+            ss.live.resize(reuse);
         }
         const auto t0 = Clock::now();
         const int64_t fresh = (int64_t) (ids.size() - reuse);
