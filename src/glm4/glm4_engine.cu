@@ -493,30 +493,38 @@ __global__ void k_attn_values(const float* sc, const __half* vc, float* part, in
     const int p0 = s < nsplit ? (int) ((int64_t) n_pos * s / nsplit) : n_pos;
     const int p1 = s < nsplit ? (int) ((int64_t) n_pos * (s + 1) / nsplit) : n_pos;
     const int np = p1 - p0;
-    for (int i = d; i < R * np; i += blockDim.x) {
-        const int h = i / np, q = i - h * np;
-        ps[h][q] = sc[(size_t) (kvh * R + h) * ctx + p0 + q];
-    }
-    __syncthreads();
     float acc[8];
     for (int h = 0; h < R; ++h) acc[h] = 0.f;
     const __half* vb = vc + (size_t) kvh * ctx * D;
     // Eight positions in flight.  The loop used to be one dependent global load per position - V[p][d] and V[p+1][d]
     // are 256 bytes apart, so 62 positions in a row cost 62 memory latencies (measured 62 us per layer).  The
     // accumulation is still done in ascending position order, one fmaf at a time, so the result is unchanged.
-    int p = 0;
-    for (; p + 7 < np; p += 8) {
-        float v[8];
-#pragma unroll
-        for (int j = 0; j < 8; ++j) v[j] = __half2float(vb[(size_t) (p0 + p + j) * D + d]);
-        for (int h = 0; h < R; ++h) {
-#pragma unroll
-            for (int j = 0; j < 8; ++j) acc[h] = fmaf(ps[h][p + j], v[j], acc[h]);
+    // `ps` holds PS_MAX positions: a split is ceil(ctx / nsplits) long, which passes 256 as soon as the context does
+    // (8193 positions at the default 32 splits), so the staging runs in windows of PS_MAX and the accumulation order
+    // - ascending positions, eight at a time - is unchanged.
+    constexpr int PS_MAX = 256;
+    for (int base = 0; base < np; base += PS_MAX) {
+        const int npc = min(PS_MAX, np - base);        // this window's positions
+        for (int i = d; i < R * npc; i += blockDim.x) {
+            const int h = i / npc, q = i - h * npc;
+            ps[h][q] = sc[(size_t) (kvh * R + h) * ctx + p0 + base + q];
         }
-    }
-    for (; p < np; ++p) {
-        const float v = __half2float(vb[(size_t) (p0 + p) * D + d]);
-        for (int h = 0; h < R; ++h) acc[h] = fmaf(ps[h][p], v, acc[h]);
+        __syncthreads();
+        int p = 0;
+        for (; p + 7 < npc; p += 8) {
+            float v[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) v[j] = __half2float(vb[(size_t) (p0 + base + p + j) * D + d]);
+            for (int h = 0; h < R; ++h) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) acc[h] = fmaf(ps[h][p + j], v[j], acc[h]);
+            }
+        }
+        for (; p < npc; ++p) {
+            const float v = __half2float(vb[(size_t) (p0 + base + p) * D + d]);
+            for (int h = 0; h < R; ++h) acc[h] = fmaf(ps[h][p], v, acc[h]);
+        }
+        __syncthreads();                               // the next window rewrites ps
     }
     for (int h = 0; h < R; ++h) part[((size_t) (kvh * R + h) * nsplits + s) * D + d] = acc[h];
 }
