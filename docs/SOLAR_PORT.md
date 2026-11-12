@@ -266,8 +266,9 @@ kNativeActBytes / kNativeHBytes grow from 4096 / 1024 to 8192 / 2048, but one ex
 
 The model used to live on `D:`, which is a **WD30PURX, a 5400 rpm HDD**.  Random 5.74 MiB reads (one expert blob)
 measure **44.6 ms median** there (p90 70 ms, min 2 ms for a page-cache hit), so a 9.4-miss token spent 43 of its 56 ms
-waiting for the platter - the engine was being benchmarked against a spinning disk.  `C:` is an NVMe (Samsung
-MZVL8512HELU).  IQ3 now lives in `C:\models\solar`, and `--prefetch` reads the whole routed-expert region once at
+waiting for the platter - the engine was being benchmarked against a spinning disk.  It moved to the Samsung NVMe
+(`C:` then, `E:` now - KLEVV CRAS C925G).  IQ3 now lives in `E:\models\solar`, and `--prefetch` reads the whole
+routed-expert region once at
 start-up so the first request does not pay cold reads (34.45 GiB in 16.2 s = 2.28 GB/s; the very first run after the
 copy managed only 805 MB/s because Windows was still writing the file back).
 
