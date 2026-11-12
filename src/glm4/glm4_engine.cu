@@ -1313,9 +1313,28 @@ struct Engine {
             hsg.push_back(L.hsg); hsu.push_back(L.hsu); hsd.push_back(L.hsd);
         }
         if (m->experts_host && !std::getenv("STRATA_GLM4_NOPIN")) pin_experts();
+        // The row-attention kernel keeps the whole context's scores in shared memory (one float per position).
+        // Above the card's opt-in limit it cannot run; this geometry (D = 128, 8 query heads per KV head) does not
+        // need it: decode uses the GEMM path past att_thresh (global memory) and the prompt pass uses flash
+        // attention, neither of which keeps a score row.  Without this a 32K context failed at start with
+        // "cudaFuncSetAttribute ... invalid argument" even though no kernel would have asked for that memory.
         int max_smem = ctx * (int) sizeof(float);
-        if (max_smem > 48 * 1024)
-            CK(cudaFuncSetAttribute((const void*) k_attn_rows, cudaFuncAttributeMaxDynamicSharedMemorySize, max_smem));
+        if (max_smem > 48 * 1024) {
+            const cudaError_t e = cudaFuncSetAttribute((const void*) k_attn_rows,
+                                                       cudaFuncAttributeMaxDynamicSharedMemorySize, max_smem);
+            if (e != cudaSuccess) {
+                (void) cudaGetLastError();
+                if (g.head_dim != 128 || g.n_head_kv <= 0 || g.n_head / g.n_head_kv != 8) {
+                    std::fprintf(stderr, "strata-glm4: context %d needs %d KiB of shared memory for the attention, "
+                                         "more than this card allows, and this head geometry has no other kernel\n",
+                                 ctx, max_smem / 1024);
+                    std::exit(1);
+                }
+                att_flash = true;   // the prompt kernel that keeps no score row (the env cannot turn this off here)
+                std::fprintf(stderr, "strata-glm4: context %d needs %d KiB of shared memory for the row attention; "
+                                     "using the GEMM decode and flash prompt kernels instead\n", ctx, max_smem / 1024);
+            }
+        }
         sess.resize((size_t) n_sess);
         size_t fr = 0, tot = 0;
         CK(cudaMemGetInfo(&fr, &tot));
