@@ -1098,8 +1098,8 @@ __global__ void k_argmax_rows(const float* lg, int n_vocab, int* out, int rows) 
 /// costs one batched forward and can never change the output.  On Korean translation the repeated material is the
 /// names, the honorific endings and the canned openings, which is what this table finds.
 struct Lookup {
-    static constexpr int K = 4;   // 4-gram: specific enough that most lookups hit the same phrase
-    std::unordered_map<uint64_t, int32_t> last;   // hash of the K tokens ending at i -> i (the index of the next token)
+    int k = 4;   // the n-gram width: 4 is specific enough that most hits continue the same way; 2 or 3 find more
+    std::unordered_map<uint64_t, int32_t> last;   // hash of the k tokens ending at i -> i (the index of the next token)
     std::vector<int32_t> hist;
 
     static uint64_t hash_of(const int32_t* t, int k) {
@@ -1110,22 +1110,26 @@ struct Lookup {
         }
         return h;
     }
-    /// Start from `ids`: every K-gram in it points at the token that followed it.
+    /// Start from `ids`: every k-gram that has a continuation in `ids` points at the index of that continuation.
+    /// `i` is that index, so it stops at size()-1 - the k-gram ending at the last token has nothing to point at, and
+    /// recording it would shadow the earlier occurrence the drafter actually wants.
     void seed(const std::vector<int32_t>& ids) {
         hist = ids;
         last.clear();
         last.reserve(ids.size());
-        for (size_t i = K; i <= hist.size(); ++i) last[hash_of(hist.data() + i - K, K)] = (int32_t) i;
+        for (size_t i = (size_t) k; i < hist.size(); ++i)
+            last[hash_of(hist.data() + i - (size_t) k, k)] = (int32_t) i;
     }
     void push(int32_t t) {
+        const size_t n = hist.size();   // the index t is about to take
         hist.push_back(t);
-        const size_t n = hist.size();
-        if (n >= (size_t) K) last[hash_of(hist.data() + n - K, K)] = (int32_t) n;
+        // the k-gram ending at n-1 now has a continuation (t at n); the k-gram ending at n still does not
+        if (n >= (size_t) k) last[hash_of(hist.data() + n - (size_t) k, k)] = (int32_t) n;
     }
-    /// Up to `m` tokens that followed the most recent occurrence of the current K-gram; 0 when it never occurred.
+    /// Up to `m` tokens that followed the most recent occurrence of the current k-gram; 0 when it never occurred.
     int draft(int32_t* out, int m) const {
-        if (hist.size() < (size_t) K) return 0;
-        const auto it = last.find(hash_of(hist.data() + hist.size() - K, K));
+        if (hist.size() < (size_t) k) return 0;
+        const auto it = last.find(hash_of(hist.data() + hist.size() - (size_t) k, k));
         if (it == last.end()) return 0;
         const size_t j = (size_t) it->second;
         int n = 0;
@@ -1202,6 +1206,7 @@ struct Engine {
     int32_t* d_pick = nullptr;
     bool spec_on = false;     // STRATA_GLM4_LOOKUP: prompt-lookup speculative decode (greedy requests)
     int spec_drafts = 4;      // tokens drafted per step
+    int spec_k = 4;           // STRATA_GLM4_LOOKUP_K: the n-gram width the drafter looks up
     cudaGraphExec_t gexec = nullptr;
     int graph_sess = -1;
     int64_t* d_pos = nullptr;
@@ -1402,6 +1407,8 @@ struct Engine {
             spec_drafts = v > 1 ? std::min(v, 6) : 4;
             spec_on = true;
         }
+        if (const char* sk = std::getenv("STRATA_GLM4_LOOKUP_K"))
+            spec_k = std::max(2, std::min(6, std::atoi(sk)));
         if (const char* sp = std::getenv("STRATA_GLM4_ATTN_SPLITS")) att_splits = std::max(1, std::atoi(sp));
         if (const char* am = std::getenv("STRATA_GLM4_ATTN")) {
             const std::string v(am);
@@ -2830,7 +2837,10 @@ struct Serve {
                          E.spec_drafts, (int) !smp.needs_logits(), (int) tmpl.mode, E.n_sess);
         const bool lk_dbg = std::getenv("STRATA_GLM4_LOOKUP_DEBUG") != nullptr;
         int dbg_left = lk_dbg ? 3 : 0;
-        if (spec) look.seed(ids);
+        if (spec) {
+            look.k = E.spec_k;
+            look.seed(ids);
+        }
         long long spec_steps = 0, spec_offered = 0, spec_taken = 0;
         for (;;) {
             if (smp.needs_logits() || tmpl.mode) {

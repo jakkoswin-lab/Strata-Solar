@@ -1082,18 +1082,69 @@ GEMM kernels, the flash prompt kernel and the value pass read through `kv_load`)
 half-only, so the flag forces the flash path and drops the decode threshold to 0 (the GEMM decode path handles every
 position).
 
-Measured on chapter 24 (1,876 tokens), same binary, only the flag changed:
+Measured on chapter 24 (1,876 tokens), same binary, only the flag changed (re-measured after the RoPE race fix below,
+so both numbers are reproducible to the last digit):
 
 | | fp16 KV | int8 KV |
 |---|---|---|
 | VRAM: KV at 32K | 6.4 GiB | 3.2 GiB |
 | expert cache at 32K | 846 slots | **1,373 slots (+62%)** |
-| **perplexity** | **19.377** | **19.345** (no measurable loss) |
+| **perplexity** | **19.389** | **19.374** (no measurable loss) |
 | decode, 10K prompt, number list | 31.1 tok/s | 30.8 tok/s (a repetitive task is cache-friendly either way) |
 | decode, 277-token translation, 119 tokens | 7.7 s | 6.3 s |
+| decode, 19.6K prompt | 15.1 tok/s | 18.7 tok/s (+24%) |
 
 So the cache grows where it matters and the text does not change measurably; the gain on a given request depends on
 how many distinct experts it uses.  `run-solar-iq3_xxs.bat` sets the flag.
+
+### The engine was not reproducible run to run (fixed)
+
+`k_qk_prep_rows` rotated in place: thread `i` read `buf[i +- n_rot/2]` while the thread that owned that slot had
+already written its rotated value there, so the scheduler decided whether the original or the rotated value was read.
+The pre-int8 code wrote the result to `qk`/`dst` instead of back into `buf`, so the race only appeared once the int8
+store needed the rotated row in shared memory.  It wrote the rotated values to a second shared row and synchronises
+before anything reads them (`90f3c58a`).
+
+What it looked like before, and why it was hard to see: the numbers were never absurd, so it read as "GPU noise".
+
+- two runs of the same 277-token prompt differed in ~7% of layer 0's Q values, up to 14.3 on a single one
+- the hidden state after layer 0 differed by ~1e-5, which is exactly the scale of a different summation order
+- that was enough to flip the router's top-k for prompt position 7 (88 vs 25 after that layer), and from there the
+  two runs were unrelated
+- the first token could be `<|think|>` in one run and `<|content|>` in the next, i.e. a visibly different reply
+
+Diagnostics that stay in the engine for this kind of work: `STRATA_GLM4_SELFCHECK=1` runs the same prompt twice in one
+process and prints the logits difference, `STRATA_GLM4_LAYER_SUM=1` prints a checksum of the hidden state after the
+attention residual and after the MoE residual of every layer, and `STRATA_GLM4_DUMP_X=<prefix>` writes the whole
+hidden state of layer 0 at its stages (embed / attn-norm / q-k after the matvec / q-k after RoPE / attention / wo), so
+two runs can be diffed element by element.  That last one is what localised the bug: `qkr` (before the RoPE) was
+bit-identical while `qk` (after it) was not.
+
+After the fix, two processes on the same prompt are bit-identical through 40 layers, and `--ppl` prints the same value
+to the last digit (19.374 twice).
+
+### Prompt-lookup speculative decode (`STRATA_GLM4_LOOKUP=<drafts>`)
+
+A decode step forwards one token.  With the flag set, the engine drafts up to N tokens from the request's own history
+(the table maps every k-gram - `STRATA_GLM4_LOOKUP_K`, default 4 - to the index of its continuation), feeds the
+current token plus its drafts in one forward, and keeps only the drafts the model itself would have picked: row r's
+argmax has to equal draft r, else the model's token is the next one and the KV is rewound to the accepted length.
+Greedy requests only (a temperature or a penalty has no "the model agreed" test) and no template mask (it advances per
+emitted token).  The output is identical to the plain loop, token for token.
+
+| 200 tokens, chapter 24 prompt | off | 4 drafts | 6 drafts |
+|---|---|---|---|
+| text that repeats the prompt (rewrite a passage that is in it) | 39.9 tok/s | **53.3 (1.34x)** | **57.6 (1.44x)** |
+| Chinese source -> Korean translation | 22.0 tok/s | 21.5 (0.98x) | 21.6 (0.98x) |
+
+Drafts accepted: 99% of those offered in the repeating case; in translation only 2 of 120 steps had a draft at all
+(those two were accepted in full).  The step count falls 5-7x where text repeats but the wall clock only 1.4x: a 7-row
+forward costs about five single-token forwards, because every row is a full matvec and the rows' experts are a bigger
+working set.  The decode is ALU-bound, so that is the ceiling - not the launch overhead.
+
+Why translation gets nothing: the table comes from the request's own tokens, which are Chinese while the reply is
+Korean.  A Korean corpus (the previous chapters) would be the next step, and the engine can only take token ids, so
+the server would have to pre-tokenize it.
 
 ## Architectures and backends
 
