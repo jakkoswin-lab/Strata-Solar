@@ -4904,6 +4904,13 @@ def slot_save_dir(value, base: str | None = None) -> str:
 SOLAR_TOOL_NUDGE = "\n\n지금 바로 적절한 도구를 호출하세요. 계획을 글로 쓰지 마세요."
 SOLAR_AFTER_TOOL = ("결과를 바탕으로 계속하세요. 더 필요한 도구가 있으면 지금 바로 호출하고, "
                     "없으면 최종 답변을 작성하세요. 계획을 글로 쓰지 마세요.")
+SOLAR_AFTER_TOOL_ERROR = ("방금 도구가 실패했습니다. 같은 명령을 그대로 다시 실행하지 말고, 오류 메시지를 읽고 "
+                          "PowerShell 문법에 맞게 고쳐서 다시 시도하세요. 계획을 글로 쓰지 마세요.")
+SOLAR_SUMMARY_NUDGE = ("\n\n위 템플릿의 각 항목을 이 대화에서 실제로 있었던 내용으로 채우세요. 템플릿의 설명 문장을 "
+                       "그대로 옮기지 말고, '[none]'이나 '(none)'만 남기지 마세요. 실행한 명령과 파일 경로는 정확히 "
+                       "적으세요.")
+SOLAR_TOOL_ERROR = re.compile(r"Exited with code|not recognized|CommandNotFoundException|ParameterBindingException|"
+                              r"Traceback \(most recent|No such file|cannot find the (file|path)", re.I)
 # What makes a message "work" rather than a question: an imperative about files or commands, or a path.  Solar writes
 # a plan and ends the turn on an indirect task ("check these files and summarize"); the nudge above makes it call the
 # tool first (measured: 4.1 s, finish=tool_calls, no plan).  A plain question ("hello") is left alone.
@@ -4922,12 +4929,24 @@ def _solar_tool_nudge(messages: list[dict]) -> list[dict]:
         return messages
     role = messages[-1].get("role")
     if role == "tool":
-        return [*messages, {"role": "user", "content": SOLAR_AFTER_TOOL}]
+        body = messages[-1].get("content")
+        text = body if isinstance(body, str) else "".join(
+            p.get("text", "") for p in body or [] if isinstance(p, dict))
+        # A failed command: measured in OpenCode, Solar re-ran `dir /s /b *.txt` four times against PowerShell, so
+        # the "continue" turn says to read the error and change the command instead.
+        note = SOLAR_AFTER_TOOL_ERROR if SOLAR_TOOL_ERROR.search(text or "") else SOLAR_AFTER_TOOL
+        return [*messages, {"role": "user", "content": note}]
     if role != "user":
         return messages
     content = messages[-1].get("content")
     text = content if isinstance(content, str) else "".join(
         p.get("text", "") for p in content or [] if isinstance(p, dict))
+    if "## Work State" in (text or "") and "<template>" in (text or ""):
+        # OpenCode's compaction request.  Measured: Solar echoed the template's own descriptions back and every
+        # section said [none], so the next agent started with no idea what had happened.
+        out = list(messages)
+        out[-1] = {**messages[-1], "content": (text or "") + SOLAR_SUMMARY_NUDGE}
+        return out
     if not SOLAR_ACTION.search(text or ""):
         return messages
     out = list(messages)

@@ -187,6 +187,42 @@ class SolarToolCalls(unittest.TestCase):
         self.assertEqual(calls[0].call.name, "read")
         self.assertEqual(calls[0].call.arguments, {"path": "C:\\x\\a.docx"})
 
+    def test_the_bracket_form_with_a_fenced_payload(self):
+        # measured in OpenCode: `<tool_call>[execute]</tool_call>` and the javascript in a ```js block after it
+        p = frontend.SolarOutputParser(tools=[{"name": "execute",
+                                               "parameters": {"type": "object", "properties": {"code": {"type": "string"}}}}])
+        out = p.feed('<tool_call>[execute]</tool_call>\n\n```js\nconst a = 1;\n```')
+        calls = [e for e in out if e.kind == "tool_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((calls[0].call.name, calls[0].call.arguments), ("execute", {"code": "const a = 1;\n"}))
+
+    def test_the_bracket_form_fills_the_tool_s_own_field(self):
+        tools = [{"name": "shell", "parameters": {"type": "object",
+                                                 "properties": {"command": {"type": "string"},
+                                                                "workdir": {"type": "string"}}}}]
+        p = frontend.SolarOutputParser(tools=tools)
+        out = p.feed('<tool_call>[shell]</tool_call>\n```powershell\ndir\n```')
+        calls = [e for e in out if e.kind == "tool_call"]
+        self.assertEqual((calls[0].call.name, calls[0].call.arguments), ("shell", {"command": "dir\n"}))
+
+    def test_a_bracket_call_with_no_fence_is_text(self):
+        p = frontend.SolarOutputParser(tools=[{"name": "execute",
+                                               "parameters": {"type": "object", "properties": {"code": {"type": "string"}}}}])
+        out = p.feed('<tool_call>[execute]</tool_call>\n\n그리고 계속 설명합니다.')
+        self.assertEqual({e.kind for e in out}, {"content"})
+        self.assertIn("그리고 계속 설명합니다", "".join(e.text for e in out))
+
+    def test_a_bracket_call_split_into_single_characters(self):
+        p = frontend.SolarOutputParser(tools=[{"name": "execute",
+                                               "parameters": {"type": "object", "properties": {"code": {"type": "string"}}}}])
+        out = []
+        for ch in '<tool_call>[execute]</tool_call>\n```js\nlet x = 2;\n```':
+            out += p.feed(ch)
+        calls = [e for e in out if e.kind == "tool_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].call.arguments, {"code": "let x = 2;\n"})
+        self.assertEqual("".join(e.text for e in out if e.kind == "content"), "")
+
     def test_the_tool_result_ids_reach_the_template(self):
         # Solar's template writes <|tool_response:begin|>ID<|tool_response:name|>NAME; the OpenAI spelling of those
         # fields has to survive openai_to_messages, or every second turn of an agent renders with an empty id/name.
@@ -215,6 +251,20 @@ class ToolNudge(unittest.TestCase):
         self.assertEqual(len(out), len(msgs) + 1)
         self.assertEqual(out[-1], {"role": "user", "content": server.SOLAR_AFTER_TOOL})
         self.assertEqual(out[:-1], msgs)
+
+    def test_a_failed_tool_result_says_to_change_the_command(self):
+        msgs = [{"role": "user", "content": "x"},
+                {"role": "tool", "tool_call_id": "a",
+                 "content": "Get-ChildItem : A positional parameter cannot be found\nExited with code 1"}]
+        out = server._solar_tool_nudge(msgs)
+        self.assertEqual(out[-1], {"role": "user", "content": server.SOLAR_AFTER_TOOL_ERROR})
+
+    def test_a_compaction_request_gets_the_fill_it_in_nudge(self):
+        ask = "You MUST use this format for your response.\n<template>\n## Objective\n- [...]\n## Work State\n- [...]\n</template>"
+        msgs = [{"role": "user", "content": ask}]
+        out = server._solar_tool_nudge(msgs)
+        self.assertTrue(out[-1]["content"].startswith(ask))
+        self.assertTrue(out[-1]["content"].endswith(server.SOLAR_SUMMARY_NUDGE))
 
     def test_a_question_is_left_alone(self):
         msgs = [{"role": "user", "content": "안녕, 오늘 기분 어때?"}]

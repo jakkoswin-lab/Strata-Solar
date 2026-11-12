@@ -2153,6 +2153,8 @@ class SolarOutputParser:
         self.refused = 0
         self._raw = ""                         # the call's markers and text so far, for the fallback to text
         self._id = self._name = self._args = ""
+        self._pending_raw = ""                 # a bracket-named call waiting for its fenced payload
+        self._pending_name = ""
 
     @property
     def clean(self) -> bool:
@@ -2232,10 +2234,44 @@ class SolarOutputParser:
                     args.setdefault(am.group(1), am.group(2))
         return self._accept(name.strip(), args, "", raw)
 
+    def _fence_args(self, name: str, code: str) -> dict:
+        """Which field a fenced block fills: the call's own name says it, the tool's schema says it when not."""
+        props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
+        for key in ("code", "command", "path", "content"):
+            if key in props:
+                return {key: code}
+        if len(props) == 1:
+            return {next(iter(props)): code}
+        return {"code": code}
+
     def feed(self, delta: str) -> list:
         self.buf += delta
         out: list = []
         while True:
+            if self.state == "fence":
+                # The model closed a call that named the tool in brackets only, and put the payload in a fenced
+                # block after it (measured in OpenCode): `<tool_call>[execute]</tool_call>` then ```js ...```.
+                s = self.buf.lstrip()
+                if not s:
+                    return out
+                if s.startswith("```"):
+                    j = s.find("\n", 3)
+                    k = s.find("```", j + 1) if j >= 0 else -1
+                    if k < 0:
+                        return out
+                    code = s[j + 1:k]
+                    raw = self._pending_raw + self.buf
+                    self.buf = ""
+                    self._pending_raw = ""
+                    self.state = "content"
+                    out += self._accept(self._pending_name, self._fence_args(self._pending_name, code), "", raw)
+                    continue
+                if len(s) < 3 and "```".startswith(s):
+                    return out
+                raw, self._pending_raw = self._pending_raw, ""
+                self.state = "content"                  # no fence: the call was text after all
+                out.append(Event("content", raw))
+                continue
             if self.state == "content":
                 i_solar = self.buf.find(self.OPEN)
                 i_xml = self.buf.find(self.XML_OPEN)
@@ -2262,6 +2298,10 @@ class SolarOutputParser:
                 raw = self._raw + body + self.XML_END
                 self.buf = self.buf[j + len(self.XML_END):]
                 self._raw, self.state = "", "content"
+                m = re.match(r"\s*\[([A-Za-z0-9_.:-]+)\]\s*$", body)
+                if m:
+                    self._pending_name, self._pending_raw, self.state = m.group(1), raw, "fence"
+                    continue
                 out += self._emit_xml(body, raw)
                 continue
             if self.state == "call_id":
@@ -2304,7 +2344,12 @@ class SolarOutputParser:
     def finish(self, reason: str | None = None) -> list:
         """End of generation: an unterminated call goes out as the text it is."""
         out: list = []
-        if self.state.startswith("call") or self.state == "xml":
+        if self.state == "fence":
+            raw, self._pending_raw, self.buf = self._pending_raw + self.buf, "", ""
+            self.state = "content"
+            if raw:
+                out.append(Event("content", raw))
+        elif self.state.startswith("call") or self.state == "xml":
             raw, self._raw, self.buf = self._raw + self.buf, "", ""
             self.state = "content"
             if raw:
