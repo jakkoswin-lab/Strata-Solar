@@ -61,7 +61,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, parser_for_template, anthropic_to_messages, anthropic_tools,  # noqa: E402
+from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, SolarOutputParser, parser_for_template, anthropic_to_messages, anthropic_tools,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -5038,11 +5038,15 @@ class Service:
             # Solar-Open-100B names its own boundaries.  A reply opens with <|content|>, which the model writes itself,
             # and a turn that ends without <|end|> (measured with a one-line prompt: <|flush|><|begin|><role>...) has
             # to end at the next message boundary too.  The markers are dropped from the text: a control token's bytes
-            # are its literal spelling, so <|content|> used to print in front of every answer.
+            # are its literal spelling, so <|content|> used to print in front of every answer.  A tool-call turn ends
+            # with <|calls|> (the template writes it after the last call), which is therefore a stop token as well;
+            # its opener <|tool_calls|> is dropped and the calls themselves are read by SolarOutputParser.
             ids = getattr(self.tok, "ids", None) or {}
             eos = (getattr(self.tok, "special_ids", None) or {}).get("tokenizer.ggml.eos_token_id", 2)
-            self.skip_ids = {int(ids[n]) for n in ("<|content|>", "<|flush|>", "<|think|>") if n in ids}
-            self.stop_ids = {int(eos)} | {int(ids[n]) for n in ("<|end|>", "<|begin|>") if n in ids}
+            self.skip_ids = {int(ids[n]) for n in ("<|content|>", "<|flush|>", "<|think|>", "<|tool_calls|>")
+                             if n in ids}
+            self.stop_ids = {int(eos)} | {int(ids[n]) for n in ("<|end|>", "<|begin|>", "<|calls|>") if n in ids}
+            self.parser_cls = SolarOutputParser
         import serve.frontend as _frontend
         _frontend.use_family(family)
 
@@ -5941,6 +5945,10 @@ class Service:
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
+        if tools and self.family == "glm4moe":
+            # Solar's template reads the OpenAI tool shape (`tool.function` in its tool block, `tool_call.function` in
+            # the history); the server keeps functions flattened for the parsers and the other families.
+            tools = [{"type": "function", "function": t} for t in tools]
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
@@ -8754,7 +8762,7 @@ def make_handler(svc: Service):
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
-            messages, tools, kw = openai_to_messages(req)
+            messages, tools, kw = openai_to_messages(req, keep_ids=svc.family == "glm4moe")
             require_messages(messages)                # an empty conversation is a 400, as OpenAI answers it, not a reply to nothing
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
@@ -9019,7 +9027,7 @@ def make_handler(svc: Service):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
             read for the same request, rendered and tokenized - the model does not run."""
             req = svc.with_shared(req, "anthropic")
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked, keep_ids=svc.family == "glm4moe")
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
@@ -9027,7 +9035,7 @@ def make_handler(svc: Service):
         def _anthropic(self, req):
             svc.load()
             req = svc.with_shared(req, "anthropic")
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked, keep_ids=svc.family == "glm4moe")
             self._no_local_images(messages)
             callable_tools, deferred = anthropic_tools(req)     # #4663: the deferred tools are callable, unlisted
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered

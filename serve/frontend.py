@@ -568,7 +568,7 @@ def require_messages(messages: list) -> None:
         raise ValueError("messages must be a non-empty list: send at least one message")
 
 
-def _order_chat_tool_results(messages: list[dict]) -> None:
+def _order_chat_tool_results(messages: list[dict], keep_ids: bool = False) -> None:
     """The template pairs results by position, so restore call order while IDs are still available.
 
     Only a complete, unambiguous run of results is reordered. Legacy or incomplete histories keep their
@@ -591,12 +591,19 @@ def _order_chat_tool_results(messages: list[dict]) -> None:
                 messages[i:j] = sorted(messages[i:j], key=lambda m: rank[m["_call_id"]])
         i = j
     for message in messages:
-        message.pop("_call_id", None)
+        # `keep_ids`: the templates that write the ids (Solar-Open-100B's `<|tool_response:begin|>ID<|tool_response:name|>NAME`)
+        # get them under the OpenAI spelling (`tool_call_id` on the result, `id` on the call).  The Qwen templates never
+        # read them, and a prompt that does not depend on the client's ids is why they are dropped by default.
+        cid = message.pop("_call_id", None)
+        if keep_ids and cid and "tool_call_id" not in message:
+            message["tool_call_id"] = cid
         for call in message.get("tool_calls") or []:
-            call.pop("_call_id", None)
+            cid = call.pop("_call_id", None)
+            if keep_ids and cid and "id" not in call:
+                call["id"] = cid
 
 
-def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
+def openai_to_messages(req: dict, keep_ids: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
     messages = []
     for i, m in enumerate(_object_list(req.get("messages"), "messages")):
@@ -622,7 +629,7 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
                               "_call_id": c.get("id")})
             out["tool_calls"] = calls
         messages.append(out)
-    _order_chat_tool_results(messages)
+    _order_chat_tool_results(messages, keep_ids)
     tools = [t.get("function", t) if t.get("type") == "function" else t
              for t in _tool_list(req.get("tools"), "function")] or None
     kwargs = {}
@@ -696,7 +703,7 @@ def _tool_references(content, deferred: dict):
             for p in content]
 
 
-def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
+def anthropic_to_messages(req: dict, think_unasked: bool = True, keep_ids: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
     without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31; False
     renders it without thinking (#278, the config's "anthropic_thinking": "on_request")."""
@@ -746,7 +753,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 out["tool_calls"] = calls
             messages.append(out)
     # A client may send results in the order its tools finished (Claude Code does for parallel calls)
-    _order_chat_tool_results(messages)
+    _order_chat_tool_results(messages, keep_ids)
     tools = [_anthropic_tool(t) for t in declared if t["name"] not in deferred] or None
     kwargs = {}
     # Anthropic: "thinking": {"type": "disabled"} or {"type": "enabled", "budget_tokens": N};
@@ -2108,6 +2115,126 @@ class JsonOutputParser(OutputParser):
                  recover: bool = False, declared_only: bool = False, deferred: bool = False):
         super().__init__(thinking=thinking, tools=tools, stream_tools=stream_tools, recover=True,
                          declared_only=declared_only, deferred=deferred)
+
+
+class SolarOutputParser:
+    """Solar-Open-100B's own call spelling, as its chat template writes it:
+
+        <|tool_call:begin|>ID<|tool_call:name|>NAME<|tool_call:args|>{json}<|tool_call:end|>
+
+    The service drops the template's wrapper markers (`<|tool_calls|>` before a turn's calls, `<|calls|>` after the
+    last) before this sees them.  Text outside a call is content.  A call whose name the request did not declare, or
+    whose arguments are not a JSON object, goes out as text (the rule the Qwen parser follows) so a client never runs
+    a call it cannot understand.  A call is reported whole at its end marker: a marker split across tokens is held
+    back, never leaked as text.  Reasoning is not parsed here - Solar's template renders an empty think block for
+    `reasoning_effort` minimal/low, and the service asks for minimal."""
+
+    OPEN = "<|tool_call:begin|>"
+    NAME = "<|tool_call:name|>"
+    ARGS = "<|tool_call:args|>"
+    END = "<|tool_call:end|>"
+
+    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
+                 recover: bool = False, declared_only: bool = False, deferred: bool = False):
+        self.state = "content"
+        self.buf = ""
+        self.schemas = {t.get("name"): t for t in tools or []}
+        self.aliases = {}
+        self.stream_tools = stream_tools
+        self.declared_only = declared_only
+        self.deferred = deferred
+        self.recover = recover
+        self.pending = []                      # (the base class's calls waiting from the reasoning: none here)
+        self.unread = 0
+        self.unread_names: list[str] = []
+        self.rescued = 0
+        self.refused = 0
+        self._raw = ""                         # the call's markers and text so far, for the fallback to text
+        self._id = self._name = self._args = ""
+
+    @property
+    def clean(self) -> bool:
+        """Nothing is held back (the service stops the thinking at a clean point; this parser never thinks)."""
+        return not self.buf
+
+    @staticmethod
+    def _hold(text: str) -> int:
+        """The longest suffix of `text` that is a proper prefix of the opening marker."""
+        for n in range(min(len(text), len(SolarOutputParser.OPEN) - 1), 0, -1):
+            if SolarOutputParser.OPEN.startswith(text[-n:]):
+                return n
+        return 0
+
+    def _emit_call(self, raw: str) -> list:
+        name = self._name.strip()
+        try:
+            args = json.loads(self._args) if self._args.strip() else {}
+        except ValueError:
+            args = None
+        declared = name in self.schemas or self.deferred or (not self.schemas and not self.declared_only)
+        if not isinstance(args, dict) or not declared:
+            self.unread += 1
+            if name:
+                self.unread_names.append(name)
+            return [Event("content", raw)]
+        cid = self._id.strip() or ("call_" + uuid.uuid4().hex[:24])
+        return [Event("tool_call", call=ToolCall(name=name, arguments=args, id=cid))]
+
+    def feed(self, delta: str) -> list:
+        self.buf += delta
+        out: list = []
+        while True:
+            if self.state == "content":
+                i = self.buf.find(self.OPEN)
+                if i < 0:
+                    hold = self._hold(self.buf)
+                    if len(self.buf) > hold:
+                        out.append(Event("content", self.buf[:len(self.buf) - hold]))
+                        self.buf = self.buf[len(self.buf) - hold:]
+                    return out
+                if i:
+                    out.append(Event("content", self.buf[:i]))
+                self.buf = self.buf[i + len(self.OPEN):]
+                self._raw, self.state = self.OPEN, "call_id"
+                self._id = self._name = self._args = ""
+            if self.state == "call_id":
+                j = self.buf.find(self.NAME)
+                if j < 0:
+                    return out
+                self._id = self.buf[:j]
+                self._raw += self._id + self.NAME
+                self.buf = self.buf[j + len(self.NAME):]
+                self.state = "call_name"
+            if self.state == "call_name":
+                j = self.buf.find(self.ARGS)
+                if j < 0:
+                    return out
+                self._name = self.buf[:j]
+                self._raw += self._name + self.ARGS
+                self.buf = self.buf[j + len(self.ARGS):]
+                self.state = "call_args"
+            if self.state == "call_args":
+                j = self.buf.find(self.END)
+                if j < 0:
+                    return out
+                self._args = self.buf[:j]
+                raw = self._raw + self._args + self.END
+                self.buf = self.buf[j + len(self.END):]
+                self._raw, self.state = "", "content"
+                out += self._emit_call(raw)
+
+    def finish(self, reason: str | None = None) -> list:
+        """End of generation: an unterminated call goes out as the text it is."""
+        out: list = []
+        if self.state.startswith("call"):
+            raw, self._raw, self.buf = self._raw + self.buf, "", ""
+            self.state = "content"
+            if raw:
+                out.append(Event("content", raw))
+        elif self.buf:
+            out.append(Event("content", self.buf))
+            self.buf = ""
+        return out
 
 
 def parser_for_template(source: str | None):
