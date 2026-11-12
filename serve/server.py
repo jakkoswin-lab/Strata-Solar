@@ -4901,6 +4901,32 @@ def slot_save_dir(value, base: str | None = None) -> str:
         raise ValueError(f"slot_save_path {path} is not a directory")
     return path
 
+SOLAR_TOOL_NUDGE = "\n\n지금 바로 적절한 도구를 호출하세요. 계획을 글로 쓰지 마세요."
+# What makes a message "work" rather than a question: an imperative about files or commands, or a path.  Solar writes
+# a plan and ends the turn on an indirect task ("check these files and summarize"); the nudge above makes it call the
+# tool first (measured: 4.1 s, finish=tool_calls, no plan).  A plain question ("hello") is left alone.
+SOLAR_ACTION = re.compile(
+    r"(?i)(확인|정리|읽|보여|실행|만들|수정|고쳐|찾|요약|검색|분석|list|read|show|run|make|create|edit|fix|find|summari|check)"
+    r"|[A-Za-z]:\\|/|\.(py|md|txt|json|toml|ya?ml|docx|gguf|cu|cpp|hpp|js|ts)\b")
+
+
+def _solar_tool_nudge(messages: list[dict]) -> list[dict]:
+    """A copy of the messages with the imperative appended to the last user message (Solar only, when it asks for work).
+
+    Only at the start of a turn: once a tool result is in the conversation the model has acted, and the same imperative
+    would push it into another call instead of the answer."""
+    if not messages or messages[-1].get("role") != "user":
+        return messages
+    content = messages[-1].get("content")
+    text = content if isinstance(content, str) else "".join(
+        p.get("text", "") for p in content or [] if isinstance(p, dict))
+    if not SOLAR_ACTION.search(text or ""):
+        return messages
+    out = list(messages)
+    out[-1] = {**messages[-1], "content": (text or "") + SOLAR_TOOL_NUDGE}
+    return out
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -5945,10 +5971,13 @@ class Service:
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
-        if tools and self.family == "glm4moe":
-            # Solar's template reads the OpenAI tool shape (`tool.function` in its tool block, `tool_call.function` in
-            # the history); the server keeps functions flattened for the parsers and the other families.
-            tools = [{"type": "function", "function": t} for t in tools]
+        if self.family == "glm4moe":
+            if tools:
+                # Solar plans and stops on an indirect task; the imperative in the user message makes it act first.
+                messages = _solar_tool_nudge(messages)
+                # Its template reads the OpenAI tool shape (`tool.function` in its tool block, `tool_call.function` in
+                # the history); the server keeps functions flattened for the parsers and the other families.
+                tools = [{"type": "function", "function": t} for t in tools]
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):

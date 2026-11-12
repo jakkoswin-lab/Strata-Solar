@@ -158,5 +158,23 @@ class SolarToolCalls(unittest.TestCase):
         self.assertEqual(out[1]["tool_call_id"], "abc123")
 
 
+class ToolNudge(unittest.TestCase):
+    """Solar writes a plan and ends the turn on an indirect task; the server appends an imperative for work messages."""
+
+    def test_a_task_gets_the_imperative(self):
+        msgs = [{"role": "system", "content": "s"},
+                {"role": "user", "content": "C:\\Translate\\Novel_ForTest 내의 파일 확인 하고 정리해줘"}]
+        out = server._solar_tool_nudge(msgs)
+        self.assertTrue(out[1]["content"].endswith(server.SOLAR_TOOL_NUDGE))
+        self.assertEqual(msgs[1]["content"], "C:\\Translate\\Novel_ForTest 내의 파일 확인 하고 정리해줘")   # a copy
+        self.assertEqual(out[0], msgs[0])
+
+    def test_a_question_is_left_alone(self):
+        msgs = [{"role": "user", "content": "안녕, 오늘 기분 어때?"}]
+        self.assertIs(server._solar_tool_nudge(msgs), msgs)
+        other = [{"role": "user", "content": "hello there"}]
+        self.assertIs(server._solar_tool_nudge(other), other)
+
+
 if __name__ == "__main__":
     unittest.main()
