@@ -4916,12 +4916,14 @@ SOLAR_SUMMARY_NUDGE = ("\n\n위 템플릿의 각 항목을 이 대화에서 실�
                        "적으세요.")
 SOLAR_TOOL_ERROR = re.compile(r"Exited with code|not recognized|CommandNotFoundException|ParameterBindingException|"
                               r"Traceback \(most recent|No such file|cannot find the (file|path)", re.I)
-SOLAR_EMPTY_TOOL = ("도구 결과가 비어 있습니다. 같은 호출을 그대로 반복하지 말고 다른 방법을 쓰세요. "
+SOLAR_EMPTY_TOOL = ("도구 결과가 비어 있습니다. 같은 호출을 그대로 반복하지 말고 지금 바로 다른 도구로 시도하세요. "
                     "계획을 글로 쓰지 마세요.")
 SOLAR_DOCX_NOTE = ("방금 read는 .docx를 읽지 못했습니다(.docx는 압축 파일입니다). 같은 read를 반복하지 말고, "
-                   "shell 도구로 다음 명령을 실행하세요: python {tool} \"<파일.docx>\" --start 1 --lines 200")
-SOLAR_DOCX_HINT = ("\n\n.docx는 압축 파일이라 read로 내용이 나오지 않습니다. shell 도구로 다음 명령을 실행하세요: "
-                   "python {tool} \"<파일.docx>\" --start 1 --lines 200")
+                   "지금 바로 shell 도구로 다음 명령을 실행하세요: python {tool} \"<파일.docx>\" --start 1 --lines 200 "
+                   "- 계획을 글로 쓰지 말고 바로 호출하세요.")
+SOLAR_DOCX_HINT = ("\n\n.docx는 압축 파일이라 read로 내용이 나오지 않습니다. read 대신 지금 바로 shell 도구로 "
+                   "다음 명령을 실행하세요: python {tool} \"<파일.docx>\" --start 1 --lines 200 - 계획을 글로 쓰지 "
+                   "말고 바로 호출하세요.")
 
 
 def _call_that_made(messages: list[dict], call_id) -> dict | None:
@@ -4976,6 +4978,9 @@ def _solar_tool_nudge(messages: list[dict], docx_tool: str = r"tools\docx_text.p
                     else SOLAR_EMPTY_TOOL)
         else:
             note = SOLAR_AFTER_TOOL
+            if ".docx" in (text or "").lower() or ".doc" in (text or "").lower():
+                # measured: a folder listing that names a .docx is followed by `read` on it, which returns nothing
+                note += SOLAR_DOCX_HINT.format(tool=docx_tool)
         return [*messages, {"role": "user", "content": note}]
     if role != "user":
         return messages
