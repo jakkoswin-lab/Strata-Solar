@@ -4918,19 +4918,101 @@ SOLAR_TOOL_ERROR = re.compile(r"Exited with code|not recognized|CommandNotFoundE
                               r"Traceback \(most recent|No such file|cannot find the (file|path)", re.I)
 SOLAR_EMPTY_TOOL = ("도구 결과가 비어 있습니다. 같은 호출을 그대로 반복하지 말고 지금 바로 다른 도구로 시도하세요. "
                     "계획을 글로 쓰지 마세요.")
+SOLAR_UNREAD = ("\n\n아직 읽지 않은 입력이 있습니다: {paths} - 이것을 지금 바로 shell 도구로 읽으세요. "
+                "이미 읽은 파일은 다시 읽지 마세요. 최종 답변은 그 다음입니다.")
+
+
+def _user_paths(messages: list[dict]) -> list[str]:
+    """Every drive path the user's message gives a line of its own (a bare path, no prose beside it)."""
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        text = m.get("content")
+        if not isinstance(text, str):
+            return []
+        out = []
+        for line in text.splitlines():
+            s = line.strip()
+            if len(s) > 3 and s[1] == ":" and s[2] in "\\/" and " " not in s:
+                out.append(s)
+        return out
+    return []
+
+
+def _norm_path(s: str) -> str:
+    """A path or a JSON-escaped path as one comparable form: lower case, forward slashes, no doubling."""
+    return re.sub(r"/{2,}", "/", (s or "").lower().replace("\\", "/"))
+
+
+def _listing_files(messages: list[dict], folder: str) -> list[str]:
+    """The entry names a tool listed for this folder ("Read directory X, entries 1-2" then one name per line)."""
+    want = _norm_path(folder)
+    for m in reversed(messages):
+        if m.get("role") != "tool":
+            continue
+        text = m.get("content")
+        if not isinstance(text, str):
+            continue
+        first, _, rest = text.partition("\n")
+        if not first.lower().startswith("read directory") or want not in _norm_path(first):
+            continue
+        return [line.strip() for line in rest.splitlines() if line.strip()]
+    return []
+
+
+def _unread(messages: list[dict]) -> list[str]:
+    """The inputs the user named that have not been read yet: a folder is done only when a document inside it is."""
+    out = []
+    for p in _user_paths(messages):
+        if not os.path.isdir(p):
+            if not _touched(messages, p):
+                out.append(p)
+            continue
+        files = _listing_files(messages, p)
+        if not files:
+            if not _touched(messages, p):
+                out.append(p)
+            continue
+        for f in files:
+            if f.lower().endswith((".xlsx", ".xls", ".docx", ".doc", ".txt", ".md")) \
+                    and not _touched(messages, os.path.join(p, f)):
+                out.append(os.path.join(p, f))
+    return out
+
+
+def _touched(messages: list[dict], path: str) -> bool:
+    """Did any tool call already read this path?  A folder counts only once something *inside* it was named: measured,
+    the model listed 98.설정집 and then answered without opening the workbook in it."""
+    want = _norm_path(path)
+    folder = os.path.isdir(path)
+    for m in messages:
+        for c in m.get("tool_calls") or []:
+            args = (c.get("function") or {}).get("arguments")
+            s = args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False)
+            try:
+                s = json.dumps(json.loads(s), ensure_ascii=False)   # unescape \\\\ and \\uXXXX
+            except (ValueError, TypeError):
+                pass
+            norm = _norm_path(s or "")
+            if folder:
+                if want + "/" in norm:                    # something under the folder was named
+                    return True
+            elif want in norm:
+                return True
+    return False
 SOLAR_DOCX_NOTE = ("방금 read는 .docx를 읽지 못했습니다(.docx는 압축 파일입니다). 같은 read를 반복하지 말고, "
                    "지금 바로 shell 도구로 다음 명령을 실행하세요: python {tool} \"<파일.docx>\" --start 1 --lines 200 "
                    "- 계획을 글로 쓰지 말고 바로 호출하세요.")
 SOLAR_DOCX_HINT = ("\n\n.docx는 압축 파일이라 read로 내용이 나오지 않습니다. read 대신 지금 바로 shell 도구로 "
                    "다음 명령을 실행하세요: python {tool} \"<파일.docx>\" --start 1 --lines 200 "
-                   "- 경로에 한글이 있으면 그대로 쓰지 말고 `*`로 바꿔 쓰세요(예: C:\\Translate\\Novel_ForTest\\2.*\\*.docx). "
+                   "- 경로는 목록에 나온 폴더와 파일 이름을 그대로 쓰세요. 한글이 있어도 됩니다. "
                    "계획을 글로 쓰지 말고 바로 호출하세요.")
 SOLAR_SHEET_NOTE = ("방금 read는 .xlsx를 읽지 못했습니다(엑셀도 압축 파일입니다). 같은 read를 반복하지 말고, 지금 "
                     "바로 shell 도구로 다음 명령을 실행하세요: python {tool} \"<파일.xlsx>\" --sheet \"<시트명>\" "
                     "--rows 50 - 계획을 글로 쓰지 말고 바로 호출하세요.")
 SOLAR_SHEET_HINT = ("\n\n.xlsx도 압축 파일이라 read로 내용이 나오지 않습니다. read 대신 지금 바로 shell 도구로 "
                     "다음 명령을 하나만 실행하세요: python {tool} \"<파일.xlsx>\" --sheet \"<시트명>\" --rows 50 "
-                    "- 경로에 한글이 있으면 그대로 쓰지 말고 `*`로 바꿔 쓰세요(예: C:\\Translate\\Novel_ForTest\\98.*\\*.xlsx). "
+                    "- 폴더와 파일 이름은 목록에 나온 그대로 쓰세요(폴더 이름 뒤에 .xlsx를 붙이면 안 됩니다). "
                     "계획을 글로 쓰지 말고 바로 호출하세요.")
 
 
@@ -5008,6 +5090,12 @@ def _solar_tool_nudge(messages: list[dict], docx_tool: str = r"tools\docx_text.p
         else:
             # measured: a folder listing that names a .docx/.xlsx is followed by `read` on it, which returns nothing
             note = SOLAR_AFTER_TOOL + _reader_hint(text, docx_tool, xlsx_tool)
+            # measured: with the novel read, the model answered a review straight away instead of opening the
+            # 설정집/가이드 the user named.  The list of what is left rides on the same "call a tool now" turn
+            # (without it the model writes a plan and stops); the reader hint is dropped there to keep it short.
+            unread = _unread(messages)
+            if unread:
+                note = SOLAR_AFTER_TOOL + SOLAR_UNREAD.format(paths=", ".join(unread[:4]))
         return [*messages, {"role": "user", "content": note}]
     if role != "user":
         return messages

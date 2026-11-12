@@ -2191,6 +2191,10 @@ class SolarOutputParser:
             args = json.loads(self._args) if self._args.strip() else {}
         except ValueError:
             args = None
+        # measured: a shell call can arrive with the command as the body instead of a JSON object
+        if args is None and name in ("shell", "bash") and self._args.strip() \
+                and not self._args.lstrip().startswith("{"):
+            args = {"command": self._args.strip()}
         # a call whose name marker was left out puts the name in the body: `{"command": "read", "arguments": {...}}`
         if isinstance(args, dict) and isinstance(args.get("arguments"), dict):
             guess = str(args.get("command") or args.get("name") or "").strip()

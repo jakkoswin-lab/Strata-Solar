@@ -226,6 +226,16 @@ class SolarToolCalls(unittest.TestCase):
         self.assertEqual(calls[0].call.arguments, {"code": "let x = 2;\n"})
         self.assertEqual("".join(e.text for e in out if e.kind == "content"), "")
 
+    def test_a_shell_call_with_the_command_as_its_body(self):
+        # measured: `<|tool_call:args|>cd C:\\x && python ...` - not JSON at all
+        p = frontend.SolarOutputParser(tools=[{"name": "shell"}])
+        raw = ('<|tool_call:begin|>8888888888<|tool_call:name|>shell<|tool_call:args|>'
+               'cd C:\\x && python -m foo --mode "proofread"<|tool_call:end|><|calls|>')
+        out = p.feed(raw)
+        calls = [e for e in out if e.kind == "tool_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].call.arguments, {"command": 'cd C:\\x && python -m foo --mode "proofread"'})
+
     def test_the_tool_result_ids_reach_the_template(self):
         # Solar's template writes <|tool_response:begin|>ID<|tool_response:name|>NAME; the OpenAI spelling of those
         # fields has to survive openai_to_messages, or every second turn of an agent renders with an empty id/name.
@@ -274,6 +284,34 @@ class ToolNudge(unittest.TestCase):
         out = server._solar_tool_nudge(msgs, r"C:\tools\docx_text.py")
         self.assertIn("docx_text.py", out[-1]["content"])
         self.assertIn("shell 도구로", out[-1]["content"])
+
+    def test_the_settings_and_guide_the_user_named_are_listed_as_unread(self):
+        # measured: the novel was read and the model answered at once, never opening 설정집/가이드
+        msgs = [{"role": "user", "content": "C:\\Translate\\Novel_ForTest\\2.MT 본 안의 소설을 검수해줘\n"
+                                            "가이드:\nC:\\Translate\\Novel_ForTest\\99.가이드\n"
+                                            "설정집:\nC:\\Translate\\Novel_ForTest\\98.설정집"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "shell", "arguments": json.dumps(
+                         {"command": "python tools\\docx_text.py \"C:\\Translate\\Novel_ForTest\\2.*\\*.docx\""})}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "1: §§§第24章\n2: #제24화\n"}]
+        unread = server._user_paths(msgs)
+        self.assertEqual(unread, [r"C:\Translate\Novel_ForTest\99.가이드",
+                                  r"C:\Translate\Novel_ForTest\98.설정집"])
+        out = server._solar_tool_nudge(msgs)
+        self.assertIn("아직 읽지 않은 입력", out[-1]["content"])
+        self.assertIn("98.설정집", out[-1]["content"])
+        self.assertIn("99.가이드", out[-1]["content"])
+
+    def test_a_path_already_read_is_not_listed(self):
+        msgs = [{"role": "user", "content": "C:\\a\\설정집 확인해줘\nC:\\a\\설정집"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "shell", "arguments": json.dumps(
+                         {"command": "python tools\\xlsx_text.py \"C:\\a\\설정집\\*.xlsx\""})}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "sheets: 1"}]
+        out = server._solar_tool_nudge(msgs)
+        self.assertNotIn("아직 읽지 않은 입력", out[-1]["content"])
 
     def test_a_tool_result_gets_a_continue_turn(self):
         msgs = [{"role": "user", "content": "x"}, {"role": "tool", "tool_call_id": "a", "content": "sub1/\nsub2/"}]
