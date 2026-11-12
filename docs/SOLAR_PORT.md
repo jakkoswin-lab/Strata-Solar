@@ -949,6 +949,25 @@ The text is the same as the CLI path's, including its two known prompt-level fau
 `*번역 규칙 준수...` paragraph, and `즉시` where the glossary forbids it); those live in the system prompt, not in
 the engine.
 
+### Every request past 8K tokens died on its first generated token (fixed, `bdf11938`)
+
+First real 16K use, in an agent loop: the engine exited with `cudaMemcpyAsync(...) failed: an illegal memory access
+was encountered`, or (without the graph) `quantize_q8_1_rows` / `cudaGraphLaunch` instead - whichever async launch
+the next sync caught. `STRATA_GLM4_DEBUG=1` (which syncs after each stage) put the fault in layer 0's attention on
+the **first decode step**: `forward n=1 pos0=8268` printed, `layer 0 attn` printed, then the sync in the next
+`dbgstep`.
+
+The decode value pass (`k_attn_values`) stages a split's softmax row in `__shared__ float ps[8][256]`.  A split is
+`ceil(n_pos / nsplits)` long and `nsplits` defaults to 32, so 256 slots hold exactly 8,192 positions; at 8,193 the
+staging loop wrote `ps[7][257]` and the kernel took the fault.  `STRATA_GLM4_ATTN_SPLITS=64` (130 slots at 8,269)
+made the crash disappear, which confirmed it.
+
+The staging now runs in windows of 256 positions with the accumulation order unchanged (ascending positions, eight
+in flight), so the arithmetic is bit-identical and shared use stays 8 KiB.  Tested on one engine: prompts of
+8,268 / 9,948 / 12,468 tokens decode at 17.8 / 17.5 / 16.2 tok/s, and a repeated 8,268-token prompt still reuses
+8,255 tokens of KV (0.3 s for the 13-token read).  The same shared tile is the only instance of the pattern in the
+tree.
+
 ## Architectures and backends
 
 `cmake/backends/cuda.cmake` defaults a hand build to `120` and warns about it: that is the RTX 50 card this engine
