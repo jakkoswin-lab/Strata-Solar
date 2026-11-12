@@ -348,18 +348,27 @@ __global__ void k_rms_rows(const float* x, const float* w, float* y, int n, floa
 
 __device__ __forceinline__ float silu(float v) { return v / (1.0f + expf(-v)); }
 
+// ---- the KV cache's element type (STRATA_GLM4_KV_INT8) --------------------------------------------------------
+// Half by default.  With the flag on, K and V are one int8 per value plus a per-(head, position) half scale, so the
+// cache takes half the VRAM and the expert cache grows.  The attention kernels read through kv_load.
+__device__ __forceinline__ float kv_load(const __half* p, float) { return __half2float(*p); }
+__device__ __forceinline__ float kv_load(const int8_t* p, float s) { return (float) (*p) * s; }
+
 /// NEOX RoPE over the first n_rot dims of each head, q in place, k (and v) appended to the cache at pos0 + row.
-__global__ void k_qk_prep_rows(float* qk, const float* v, __half* kc, __half* vc, int H, int HKV, int D, int n_rot,
-                               const int64_t* pos0p, int ctx, float base) {
+/// `KT` is the cache element type; with int8_t the block scales each head's 128 values to +-127 and keeps the scale.
+template <class KT>
+__global__ void k_qk_prep_rows(float* qk, const float* v, KT* kc, KT* vc, __half* ksc, __half* vsc, int H, int HKV,
+                               int D, int n_rot, const int64_t* pos0p, int ctx, float base) {
     __shared__ float buf[512];
+    __shared__ float red[128];
     const int per = H + HKV;
     const int row = blockIdx.x / per, head = blockIdx.x % per;
     const bool isq = head < H;
+    const int hkv = head - H;
     const float* src = qk + ((size_t) row * per + head) * D;
     for (int i = threadIdx.x; i < D; i += blockDim.x) buf[i] = src[i];
     __syncthreads();
     const int64_t pos = *pos0p + row;
-    __half* dst = isq ? nullptr : kc + (((size_t) (head - H) * ctx + pos) * D);
     const int half = n_rot / 2;
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
         float w = buf[i];
@@ -369,13 +378,38 @@ __global__ void k_qk_prep_rows(float* qk, const float* v, __half* kc, __half* vc
             const float cs = cosf(theta), sn = sinf(theta);
             w = i < half ? buf[i] * cs - buf[i + half] * sn : buf[i - half] * sn + buf[i] * cs;
         }
-        if (isq) qk[((size_t) row * per + head) * D + i] = w;
-        else dst[i] = __float2half(w);
+        buf[i] = w;
     }
-    if (!isq)
-        for (int i = threadIdx.x; i < D; i += blockDim.x)
-            vc[((size_t) (head - H) * ctx + pos) * D + i] =
-                __float2half(v[((size_t) row * HKV + (head - H)) * D + i]);
+    __syncthreads();
+    if (isq) {
+        for (int i = threadIdx.x; i < D; i += blockDim.x) qk[((size_t) row * per + head) * D + i] = buf[i];
+        return;
+    }
+    // one (head, position) row of the cache: quantize buf (K) or the value row (V)
+    auto store = [&](KT* dst, __half* scale, size_t slot) {
+        if constexpr (sizeof(KT) == 1) {
+            float amax = 0.f;
+            for (int i = threadIdx.x; i < D; i += blockDim.x) amax = fmaxf(amax, fabsf(buf[i]));
+            red[threadIdx.x] = amax;
+            __syncthreads();
+            for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+                if ((int) threadIdx.x < s2) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s2]);
+                __syncthreads();
+            }
+            const float sc = red[0] > 0.f ? red[0] / 127.f : 1.f;
+            for (int i = threadIdx.x; i < D; i += blockDim.x) dst[i] = (KT) __float2int_rn(buf[i] / sc);
+            if (threadIdx.x == 0) scale[slot] = __float2half(sc);
+        } else {
+            for (int i = threadIdx.x; i < D; i += blockDim.x) dst[i] = (KT) __float2half(buf[i]);
+        }
+    };
+    KT* kdst = kc + (((size_t) hkv * ctx + pos) * D);
+    store(kdst, ksc, (size_t) hkv * ctx + pos);
+    __syncthreads();
+    for (int i = threadIdx.x; i < D; i += blockDim.x) buf[i] = v[((size_t) row * HKV + hkv) * D + i];
+    __syncthreads();
+    KT* vdst = vc + (((size_t) hkv * ctx + pos) * D);
+    store(vdst, vsc, (size_t) hkv * ctx + pos);
 }
 
 /// Causal attention for row `blockIdx.y` (position pos0 + row) over the cache's positions 0 .. pos0 + row.
@@ -425,8 +459,9 @@ __global__ void k_attn_rows(const float* q, const __half* kc, const __half* vc, 
 //   C values: block per (kv head, position split); 128 threads cover D; V[p][d] is read once and applied to the 8
 //     heads' probabilities.
 //   D combine: sum the splits.
-__global__ void k_attn_scores(const float* qk, const __half* kc, float* sc, int H, int HKV, int D, int ctx,
-                              const int64_t* pos0p, float scale) {
+template <class KT>
+__global__ void k_attn_scores(const float* qk, const KT* kc, const __half* ksc, float* sc, int H, int HKV, int D,
+                              int ctx, const int64_t* pos0p, float scale) {
     const int n_pos = (int) (*pos0p) + 1;
     __shared__ __half tile[128][130];
     __shared__ float qs[8][128];   // this KV head's query rows: the inner loop then touches shared memory only
@@ -434,9 +469,13 @@ __global__ void k_attn_scores(const float* qk, const __half* kc, float* sc, int 
     const int p0 = t * 128;
     if (p0 >= n_pos) return;
     const int d = threadIdx.x, R = H / HKV;
-    const __half* kb = kc + (size_t) kvh * ctx * D;
-    for (int i = 0; i < 128; ++i)
-        tile[i][d] = (p0 + i < n_pos) ? kb[(size_t) (p0 + i) * D + d] : __float2half(0.f);
+    const KT* kb = kc + (size_t) kvh * ctx * D;
+    const __half* ks = ksc ? ksc + (size_t) kvh * ctx : nullptr;
+    for (int i = 0; i < 128; ++i) {
+        const bool ok = p0 + i < n_pos;
+        const float s = (ok && ks) ? __half2float(ks[p0 + i]) : 1.f;
+        tile[i][d] = ok ? __float2half(kv_load(&kb[(size_t) (p0 + i) * D + d], s)) : __float2half(0.f);
+    }
     for (int i = d; i < R * D; i += blockDim.x) qs[i / D][i % D] = qk[(size_t) kvh * R * D + i];
     __syncthreads();
     const int i = threadIdx.x;   // one thread per position of the tile
@@ -481,8 +520,9 @@ __global__ void k_attn_softmax(float* sc, int H, int ctx, const int64_t* pos0p) 
     for (int p = threadIdx.x; p < n_pos; p += blockDim.x) row[p] *= inv;
 }
 
-__global__ void k_attn_values(const float* sc, const __half* vc, float* part, int H, int HKV, int D, int ctx,
-                              const int64_t* pos0p, int nsplits) {
+template <class KT>
+__global__ void k_attn_values(const float* sc, const KT* vc, const __half* vsc, float* part, int H, int HKV, int D,
+                              int ctx, const int64_t* pos0p, int nsplits) {
     const int n_pos = (int) (*pos0p) + 1;
     // The probabilities are head-major, so reading eight of them per position was eight scattered loads.  The
     // split's slice is small (positions/nsplits ~ 64), so stage it in shared once and read it as one block.
@@ -496,7 +536,8 @@ __global__ void k_attn_values(const float* sc, const __half* vc, float* part, in
     const int np = p1 - p0;
     float acc[8];
     for (int h = 0; h < R; ++h) acc[h] = 0.f;
-    const __half* vb = vc + (size_t) kvh * ctx * D;
+    const KT* vb = vc + (size_t) kvh * ctx * D;
+    const __half* vs = vsc ? vsc + (size_t) kvh * ctx : nullptr;
     // Eight positions in flight.  The loop used to be one dependent global load per position - V[p][d] and V[p+1][d]
     // are 256 bytes apart, so 62 positions in a row cost 62 memory latencies (measured 62 us per layer).  The
     // accumulation is still done in ascending position order, one fmaf at a time, so the result is unchanged.
@@ -515,14 +556,18 @@ __global__ void k_attn_values(const float* sc, const __half* vc, float* part, in
         for (; p + 7 < npc; p += 8) {
             float v[8];
 #pragma unroll
-            for (int j = 0; j < 8; ++j) v[j] = __half2float(vb[(size_t) (p0 + base + p + j) * D + d]);
+            for (int j = 0; j < 8; ++j) {
+                const int pj = p0 + base + p + j;
+                v[j] = kv_load(&vb[(size_t) pj * D + d], vs ? __half2float(vs[pj]) : 1.f);
+            }
             for (int h = 0; h < R; ++h) {
 #pragma unroll
                 for (int j = 0; j < 8; ++j) acc[h] = fmaf(ps[h][p + j], v[j], acc[h]);
             }
         }
         for (; p < npc; ++p) {
-            const float v = __half2float(vb[(size_t) (p0 + base + p) * D + d]);
+            const int pj = p0 + base + p;
+            const float v = kv_load(&vb[(size_t) pj * D + d], vs ? __half2float(vs[pj]) : 1.f);
             for (int h = 0; h < R; ++h) acc[h] = fmaf(ps[h][p], v, acc[h]);
         }
         __syncthreads();                               // the next window rewrites ps
@@ -665,8 +710,9 @@ __global__ void k_attn_rows_fast(const float* q, const __half* kc, const __half*
 /// instead of eight times, and the running max / sum / value accumulators live in registers and shared (about 9 KB
 /// total, against the 40 KB an all-heads version with a stored score row needs - that one measured 2.3x slower for
 /// exactly that reason).
-__global__ void k_attn_flash(const float* q, const __half* kc, const __half* vc, float* out, int H, int HKV, int D,
-                             int64_t pos0, int ctx, float scale) {
+template <class KT>
+__global__ void k_attn_flash(const float* q, const KT* kc, const KT* vc, const __half* ksc, const __half* vsc,
+                             float* out, int H, int HKV, int D, int64_t pos0, int ctx, float scale) {
     constexpr int RB = 4;                    // query heads per block (8 measured slower: double the shared)
     constexpr int TILE = 64;                 // positions per tile
     const int kvh = blockIdx.x >> 1, hg = blockIdx.x & 1;
@@ -693,10 +739,12 @@ __global__ void k_attn_flash(const float* q, const __half* kc, const __half* vc,
     for (int t0 = 0; t0 < n_pos; t0 += TILE) {
         const int tn = min(TILE, n_pos - t0);
         for (int j = warp; j < tn; j += 4) {
-            const __half* kp = kc + ((size_t) kvh * ctx + t0 + j) * D;
+            const int pj = t0 + j;
+            const KT* kp = kc + ((size_t) kvh * ctx + pj) * D;
+            const float ks = ksc ? __half2float(ksc[(size_t) kvh * ctx + pj]) : 1.f;
             float kv[4];
 #pragma unroll
-            for (int i = 0; i < 4; ++i) kv[i] = __half2float(kp[lane + i * 32]);
+            for (int i = 0; i < 4; ++i) kv[i] = kv_load(kp + lane + i * 32, ks);
             for (int h = 0; h < RB; ++h) {
                 float sv = 0.f;
 #pragma unroll
@@ -728,12 +776,14 @@ __global__ void k_attn_flash(const float* q, const __half* kc, const __half* vc,
             for (int i = 0; i < 4; ++i) acc[h][i] *= rsc;
         }
         for (int j = warp; j < tn; j += 4) {
-            const __half* vp = vc + ((size_t) kvh * ctx + t0 + j) * D;
+            const int pj = t0 + j;
+            const KT* vp = vc + ((size_t) kvh * ctx + pj) * D;
+            const float vsc_j = vsc ? __half2float(vsc[(size_t) kvh * ctx + pj]) : 1.f;
             float pv[RB];
             for (int h = 0; h < RB; ++h) pv[h] = st[h][j];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                const float v = __half2float(vp[lane + i * 32]);
+                const float v = kv_load(vp + lane + i * 32, vsc_j);
                 for (int h = 0; h < RB; ++h) acc[h][i] = fmaf(pv[h], v, acc[h][i]);
             }
         }
@@ -1020,6 +1070,12 @@ float* dalloc(size_t n) {
     CK(cudaMemset(p, 0, n * 4));
     return p;
 }
+void* balloc(size_t bytes) {
+    void* p = nullptr;
+    CK(cudaMalloc(&p, bytes));
+    CK(cudaMemset(p, 0, bytes));
+    return p;
+}
 template <class T> T* dalloc_t(size_t n) {
     T* p = nullptr;
     CK(cudaMalloc(&p, n * sizeof(T)));
@@ -1163,10 +1219,13 @@ struct Engine {
     void** d_wp_d = nullptr;
     int32_t *d_xc_row = nullptr, *d_xc_col = nullptr;
     std::vector<const void*> hwp_g, hwp_d;
-    std::vector<__half*> kc, vc;
+    std::vector<void*> kc, vc;             // __half* or int8_t* (STRATA_GLM4_KV_INT8)
+    std::vector<__half*> ksc, vsc;         // the per-(head, position) scales; null on the half path
+    bool kv_i8 = false;
     std::vector<HostMat> hq, hk, hv, ho, hg, hu, hd, hsg, hsu, hsd;
     struct Sess {
-        std::vector<__half*> kc, vc;
+        std::vector<void*> kc, vc;
+        std::vector<__half*> ksc, vsc;
         int64_t pos = 0;
         std::vector<int32_t> live;
         bool active = false;
@@ -1183,8 +1242,11 @@ struct Engine {
     void alloc_session(Sess& ss) const {
         const auto& g = m->g;
         for (size_t l = 0; l < m->layers.size(); ++l) {
-            ss.kc.push_back(dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim));
-            ss.vc.push_back(dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim));
+            const size_t cells = (size_t) g.n_head_kv * ctx * g.head_dim;
+            ss.kc.push_back(balloc(cells * (kv_i8 ? 1 : 2)));
+            ss.vc.push_back(balloc(cells * (kv_i8 ? 1 : 2)));
+            ss.ksc.push_back(kv_i8 ? dalloc_t<__half>((size_t) g.n_head_kv * ctx) : nullptr);
+            ss.vsc.push_back(kv_i8 ? dalloc_t<__half>((size_t) g.n_head_kv * ctx) : nullptr);
         }
     }
     void select(int i) {
@@ -1197,15 +1259,22 @@ struct Engine {
         Sess& ss = sess[(size_t) cur];
         kc = ss.kc;
         vc = ss.vc;
+        ksc = ss.ksc;
+        vsc = ss.vsc;
         pos = ss.pos;
         ss.used = ++use_clock;
     }
     void copy_session(int src, int dst) {
         const auto& g = m->g;
-        const size_t kb = (size_t) g.n_head_kv * ctx * g.head_dim * 2;   // __half
+        const size_t kb = (size_t) g.n_head_kv * ctx * g.head_dim * (kv_i8 ? 1 : 2);
+        const size_t sb = (size_t) g.n_head_kv * ctx * 2;
         for (size_t l = 0; l < m->layers.size(); ++l) {
             CK(cudaMemcpyAsync(sess[(size_t) dst].kc[l], sess[(size_t) src].kc[l], kb, cudaMemcpyDeviceToDevice, st));
             CK(cudaMemcpyAsync(sess[(size_t) dst].vc[l], sess[(size_t) src].vc[l], kb, cudaMemcpyDeviceToDevice, st));
+            if (kv_i8) {
+                CK(cudaMemcpyAsync(sess[(size_t) dst].ksc[l], sess[(size_t) src].ksc[l], sb, cudaMemcpyDeviceToDevice, st));
+                CK(cudaMemcpyAsync(sess[(size_t) dst].vsc[l], sess[(size_t) src].vsc[l], sb, cudaMemcpyDeviceToDevice, st));
+            }
         }
         sess[(size_t) dst].pos = sess[(size_t) src].pos;
         sess[(size_t) dst].live = sess[(size_t) src].live;
@@ -1235,6 +1304,19 @@ struct Engine {
         graph_enabled = std::getenv("STRATA_GLM4_NOGRAPH") == nullptr;
         if (const char* v = std::getenv("STRATA_GLM4_ATTN_SKIP")) attn_skip = std::atoi(v);
         att_flash = std::getenv("STRATA_GLM4_NO_ATTN_FLASH") == nullptr;
+        // STRATA_GLM4_KV_INT8: the cache holds one int8 per value plus a per-(head, position) scale, so it takes
+        // half the VRAM and the expert cache grows.  Only the GEMM decode and flash prompt kernels carry it, so the
+        // decode threshold is dropped to 0 and the flash path is forced (the older kernels stay half-only).
+        kv_i8 = std::getenv("STRATA_GLM4_KV_INT8") != nullptr;
+        if (kv_i8) {
+            if (m->g.head_dim != 128) {
+                std::fprintf(stderr, "strata-glm4: STRATA_GLM4_KV_INT8 needs head_dim 128 (this model: %lld)\n",
+                             (long long) m->g.head_dim);
+                std::exit(2);
+            }
+            att_thresh = 0;
+            att_flash = true;
+        }
         prof = std::getenv("STRATA_GLM4_PROF") != nullptr;
         if (const char* sp = std::getenv("STRATA_GLM4_ATTN_SPLITS")) att_splits = std::max(1, std::atoi(sp));
         if (const char* am = std::getenv("STRATA_GLM4_ATTN")) {
@@ -1446,10 +1528,15 @@ struct Engine {
     }
 
     void reset() {
-        const size_t kb = (size_t) m->g.n_head_kv * ctx * m->g.head_dim * 2;   // __half
+        const size_t kb = (size_t) m->g.n_head_kv * ctx * m->g.head_dim * (kv_i8 ? 1 : 2);
+        const size_t sb = (size_t) m->g.n_head_kv * ctx * 2;
         for (size_t l = 0; l < kc.size(); ++l) {
             CK(cudaMemsetAsync(kc[l], 0, kb, st));
             CK(cudaMemsetAsync(vc[l], 0, kb, st));
+            if (kv_i8) {
+                CK(cudaMemsetAsync(ksc[l], 0, sb, st));
+                CK(cudaMemsetAsync(vsc[l], 0, sb, st));
+            }
         }
         CK(cudaStreamSynchronize(st));
         pos = 0;
@@ -1668,36 +1755,62 @@ struct Engine {
                 }
             }
             mm(L.wv, h, vx, n);
-            k_qk_prep_rows<<<(unsigned) (n * (H + HKV)), kThreads, 0, st>>>(qkf, vx, kc[(size_t) l], vc[(size_t) l],
-                                                                           H, HKV, D, m->n_rot, d_pos, ctx,
-                                                                           m->rope_base);
+            if (kv_i8)
+                k_qk_prep_rows<int8_t><<<(unsigned) (n * (H + HKV)), kThreads, 0, st>>>(
+                    qkf, vx, (int8_t*) kc[(size_t) l], (int8_t*) vc[(size_t) l], ksc[(size_t) l], vsc[(size_t) l],
+                    H, HKV, D, m->n_rot, d_pos, ctx, m->rope_base);
+            else
+                k_qk_prep_rows<__half><<<(unsigned) (n * (H + HKV)), kThreads, 0, st>>>(
+                    qkf, vx, (__half*) kc[(size_t) l], (__half*) vc[(size_t) l], nullptr, nullptr,
+                    H, HKV, D, m->n_rot, d_pos, ctx, m->rope_base);
             if ((force_gemm || att_gemm || pos0 + 1 >= att_thresh) && n == 1 && D == 128 && HKV > 0 && H / HKV == 8) {
                 // GEMM-style decode attention: K / V are read once for the 8 heads that share a KV head
                 const int tiles = att_tiles, nsplits = att_nsplits;
                 const float scale = 1.0f / sqrtf((float) D);
                 cudaEvent_t* ea = pf ? &pev_a[(size_t) (8 * l)] : nullptr;
                 if (pf) CK(cudaEventRecord(ea[0], st));
-                k_attn_scores<<<dim3(HKV, tiles), 128, 0, st>>>(qkf, kc[(size_t) l], att_sc, H, HKV, D, ctx, d_pos,
-                                                                scale);
+                if (kv_i8)
+                    k_attn_scores<int8_t><<<dim3(HKV, tiles), 128, 0, st>>>(
+                        qkf, (const int8_t*) kc[(size_t) l], ksc[(size_t) l], att_sc, H, HKV, D, ctx, d_pos, scale);
+                else
+                    k_attn_scores<__half><<<dim3(HKV, tiles), 128, 0, st>>>(
+                        qkf, (const __half*) kc[(size_t) l], nullptr, att_sc, H, HKV, D, ctx, d_pos, scale);
                 if (pf) CK(cudaEventRecord(ea[1], st));
                 k_attn_softmax<<<H, kThreads, 0, st>>>(att_sc, H, ctx, d_pos);
                 if (pf) CK(cudaEventRecord(ea[2], st));
-                k_attn_values<<<dim3(HKV, nsplits), 128, 0, st>>>(att_sc, vc[(size_t) l], att_part, H, HKV, D, ctx,
-                                                                  d_pos, nsplits);
+                if (kv_i8)
+                    k_attn_values<int8_t><<<dim3(HKV, nsplits), 128, 0, st>>>(
+                        att_sc, (const int8_t*) vc[(size_t) l], vsc[(size_t) l], att_part, H, HKV, D, ctx, d_pos,
+                        nsplits);
+                else
+                    k_attn_values<__half><<<dim3(HKV, nsplits), 128, 0, st>>>(
+                        att_sc, (const __half*) vc[(size_t) l], nullptr, att_part, H, HKV, D, ctx, d_pos, nsplits);
                 if (pf) CK(cudaEventRecord(ea[3], st));
                 k_attn_combine<<<H, 128, 0, st>>>(att_part, att, H, D, nsplits, D);
                 if (pf) CK(cudaEventRecord(ea[4], st));
             } else if (D == 128)
-                if (att_flash && n > 1 && H / HKV == 8 && D == 128)
-                    k_attn_flash<<<dim3(HKV * 2, n), kThreads, 0, st>>>(qkf, kc[(size_t) l], vc[(size_t) l], att, H,
-                                                                        HKV, D, pos0, ctx, 1.0f / sqrtf((float) D));
-                else
+                if (att_flash && n > 1 && H / HKV == 8 && D == 128) {
+                    if (kv_i8)
+                        k_attn_flash<int8_t><<<dim3(HKV * 2, n), kThreads, 0, st>>>(
+                            qkf, (const int8_t*) kc[(size_t) l], (const int8_t*) vc[(size_t) l], ksc[(size_t) l],
+                            vsc[(size_t) l], att, H, HKV, D, pos0, ctx, 1.0f / sqrtf((float) D));
+                    else
+                        k_attn_flash<__half><<<dim3(HKV * 2, n), kThreads, 0, st>>>(
+                            qkf, (const __half*) kc[(size_t) l], (const __half*) vc[(size_t) l], nullptr, nullptr,
+                            att, H, HKV, D, pos0, ctx, 1.0f / sqrtf((float) D));
+                } else {
+                    if (kv_i8) {   // the older prompt kernels are half-only; kv_i8 forces the flash path above
+                        std::fprintf(stderr, "strata-glm4: STRATA_GLM4_KV_INT8 needs the flash prompt kernel\n");
+                        std::exit(2);
+                    }
                     k_attn_rows_fast<<<dim3(H, n), kThreads, (size_t) (pos0 + n) * sizeof(float), st>>>(
-                        qkf, kc[(size_t) l], vc[(size_t) l], att, H, HKV, D, pos0, ctx, 1.0f / sqrtf((float) D),
-                        attn_skip);
+                        qkf, (const __half*) kc[(size_t) l], (const __half*) vc[(size_t) l], att, H, HKV, D, pos0,
+                        ctx, 1.0f / sqrtf((float) D), attn_skip);
+                }
             else
                 k_attn_rows<<<dim3(H, n), kThreads, (size_t) (pos0 + n) * sizeof(float), st>>>(
-                    qkf, kc[(size_t) l], vc[(size_t) l], att, H, HKV, D, pos0, ctx, 1.0f / sqrtf((float) D));
+                    qkf, (const __half*) kc[(size_t) l], (const __half*) vc[(size_t) l], att, H, HKV, D, pos0, ctx,
+                    1.0f / sqrtf((float) D));
             if (l == 0 && std::getenv("STRATA_GLM4_ATTN_DUMP")) {
                 std::vector<float> h((size_t) H * D);
                 CK(cudaMemcpyAsync(h.data(), att, h.size() * 4, cudaMemcpyDeviceToHost, st));

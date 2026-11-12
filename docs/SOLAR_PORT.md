@@ -1074,6 +1074,27 @@ allowed set, the id limit, a second call in one turn, and "off changes nothing")
 
     cl /nologo /std:c++20 /EHsc /I include src/glm4/tmpl_mask_test.cpp /Fe:tmpl_mask_test.exe
 
+### KV cache in int8 (`STRATA_GLM4_KV_INT8=1`)
+
+The half cache is 6.4 GiB at 32K and that is what sets the expert cache's size.  With the flag on, K and V are stored as
+one int8 per value plus a per-(head, position) half scale (`k_qk_prep_rows` scales each row of 128 to +-127; the decode
+GEMM kernels, the flash prompt kernel and the value pass read through `kv_load`).  The older fallback prompt kernel is
+half-only, so the flag forces the flash path and drops the decode threshold to 0 (the GEMM decode path handles every
+position).
+
+Measured on chapter 24 (1,876 tokens), same binary, only the flag changed:
+
+| | fp16 KV | int8 KV |
+|---|---|---|
+| VRAM: KV at 32K | 6.4 GiB | 3.2 GiB |
+| expert cache at 32K | 846 slots | **1,373 slots (+62%)** |
+| **perplexity** | **19.377** | **19.345** (no measurable loss) |
+| decode, 10K prompt, number list | 31.1 tok/s | 30.8 tok/s (a repetitive task is cache-friendly either way) |
+| decode, 277-token translation, 119 tokens | 7.7 s | 6.3 s |
+
+So the cache grows where it matters and the text does not change measurably; the gain on a given request depends on
+how many distinct experts it uses.  `run-solar-iq3_xxs.bat` sets the flag.
+
 ## Architectures and backends
 
 `cmake/backends/cuda.cmake` defaults a hand build to `120` and warns about it: that is the RTX 50 card this engine
