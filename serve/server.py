@@ -4902,6 +4902,8 @@ def slot_save_dir(value, base: str | None = None) -> str:
     return path
 
 SOLAR_TOOL_NUDGE = "\n\n지금 바로 적절한 도구를 호출하세요. 계획을 글로 쓰지 마세요."
+SOLAR_AFTER_TOOL = ("결과를 바탕으로 계속하세요. 더 필요한 도구가 있으면 지금 바로 호출하고, "
+                    "없으면 최종 답변을 작성하세요. 계획을 글로 쓰지 마세요.")
 # What makes a message "work" rather than a question: an imperative about files or commands, or a path.  Solar writes
 # a plan and ends the turn on an indirect task ("check these files and summarize"); the nudge above makes it call the
 # tool first (measured: 4.1 s, finish=tool_calls, no plan).  A plain question ("hello") is left alone.
@@ -4911,11 +4913,17 @@ SOLAR_ACTION = re.compile(
 
 
 def _solar_tool_nudge(messages: list[dict]) -> list[dict]:
-    """A copy of the messages with the imperative appended to the last user message (Solar only, when it asks for work).
+    """Solar plans and stops on an indirect task; a direct imperative makes it act (measured).
 
-    Only at the start of a turn: once a tool result is in the conversation the model has acted, and the same imperative
-    would push it into another call instead of the answer."""
-    if not messages or messages[-1].get("role") != "user":
+    At the start of a turn the imperative goes into the user message.  After a tool result the model reads the result
+    and writes its next plan as text, so a short "continue" user turn is added: measured, `list_dir` on the folder is
+    called in 4.3 s that way, where the same instruction inside the tool result made it answer without looking."""
+    if not messages:
+        return messages
+    role = messages[-1].get("role")
+    if role == "tool":
+        return [*messages, {"role": "user", "content": SOLAR_AFTER_TOOL}]
+    if role != "user":
         return messages
     content = messages[-1].get("content")
     text = content if isinstance(content, str) else "".join(
