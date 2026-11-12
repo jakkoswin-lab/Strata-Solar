@@ -9,6 +9,7 @@ from __future__ import annotations
 import sys
 import types
 import unittest
+import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -271,6 +272,35 @@ class ToolNudge(unittest.TestCase):
         self.assertIs(server._solar_tool_nudge(msgs), msgs)
         other = [{"role": "user", "content": "hello there"}]
         self.assertIs(server._solar_tool_nudge(other), other)
+
+
+class DropSystemPrompt(unittest.TestCase):
+    """The config's "drop_system_prompt": Solar's template writes the tool block itself, and an agent's system prompt
+    (OpenCode's code-mode `execute`) pulls it out of its own call format."""
+
+    def _svc(self, drop):
+        class T:
+            def render(self, messages, tools=None, add_generation_prompt=True, **kw):
+                return json.dumps({"messages": messages, "tools": tools})
+        svc = object.__new__(server.Service)
+        svc.family, svc.drop_system, svc.effort_end, svc.template = "glm4moe", drop, False, T()
+        return svc
+
+    def test_with_tools_drops_the_system_turn(self):
+        msgs = [{"role": "system", "content": "you are opencode"}, {"role": "user", "content": "파일 확인해줘"}]
+        out = json.loads(self._svc("with_tools").render_prompt(msgs, [{"name": "shell", "parameters": {}}], {}))
+        self.assertEqual([m["role"] for m in out["messages"]], ["user"])
+        self.assertEqual(out["tools"], [{"type": "function", "function": {"name": "shell", "parameters": {}}}])
+
+    def test_without_tools_the_system_turn_stays(self):
+        msgs = [{"role": "system", "content": "번역 규칙"}, {"role": "user", "content": "번역해줘"}]
+        out = json.loads(self._svc("with_tools").render_prompt(msgs, None, {}))
+        self.assertEqual([m["role"] for m in out["messages"]], ["system", "user"])
+
+    def test_true_drops_it_even_without_tools(self):
+        msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "안녕"}]
+        out = json.loads(self._svc(True).render_prompt(msgs, None, {}))
+        self.assertEqual([m["role"] for m in out["messages"]], ["user"])
 
 
 if __name__ == "__main__":

@@ -4971,6 +4971,7 @@ class Service:
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
+        self.drop_system = False                      # the config's "drop_system_prompt" (Solar: see render_prompt)
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
@@ -5999,6 +6000,11 @@ class Service:
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
         if self.family == "glm4moe":
+            # The config's "drop_system_prompt": an agent's system prompt (OpenCode's describes a code-mode `execute`
+            # tool) pulls Solar out of its own tool format, and its template writes the tool definitions into the
+            # system block itself.  True drops every system turn, "with_tools" only when the request has tools.
+            if self.drop_system is True or (self.drop_system == "with_tools" and tools):
+                messages = [m for m in messages if m.get("role") != "system"]
             if tools:
                 # Solar plans and stops on an indirect task; the imperative in the user message makes it act first.
                 messages = _solar_tool_nudge(messages)
@@ -10519,6 +10525,13 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                   "Chat settings shared with other apps, can set its own)", flush=True)
     svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default
     svc.codex_compaction_cache = cfg.get("codex_compaction_cache") is True   # #924: opt-in, off by default
+    drop = cfg.get("drop_system_prompt")                # Solar: an agent's system prompt pulls it out of its format
+    if drop not in (None, False, True, "with_tools"):
+        raise SystemExit('[strata] config "drop_system_prompt" must be true, false or "with_tools"')
+    if drop:
+        svc.drop_system = drop
+        print(f"[strata] system prompts: {'dropped' if drop is True else 'dropped when the request has tools'}"
+              " (drop_system_prompt in the config)", flush=True)
     try:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
     except ValueError as e:
