@@ -968,6 +968,25 @@ in flight), so the arithmetic is bit-identical and shared use stays 8 KiB.  Test
 8,255 tokens of KV (0.3 s for the 13-token read).  The same shared tile is the only instance of the pattern in the
 tree.
 
+### What it costs: 16K against 32K (the deployment is 32K now)
+
+An agent loop puts 3.4K of system prompt and tool definitions in front of every turn and reserves 4-8K for the
+answer, so a 16K window leaves about 6K of conversation: OpenCode compacted three turns into a folder check.  32K
+was measured on the same card (RTX 5060 Ti 16 GB, IQ3_XXS):
+
+| | 16K | 32K |
+|---|---|---|
+| expert cache | 1,382 slots = 7.75 GiB | 846 slots = 4.74 GiB |
+| KV cache | 3.2 GiB | 6.4 GiB |
+| prefill | 150 tok/s (2.2K prompt) | 109 tok/s (12K prompt), 66 tok/s (6K increment past 12K) |
+| decode at 12-24K positions | - | 12.9 / 14.5 / 13.5 tok/s |
+| decode, short prompt | 23-26 tok/s | 19.4 tok/s |
+| KV reuse | - | 17,915 of 17,928 tokens in 0.6 s |
+
+The decode drop is the cache, not the context: doubling the KV takes 3.2 GiB away from the experts, and the hit rate
+goes from about 90% to about 70%.  A turn that only adds a tool result still prefills a few hundred tokens (2-3 s),
+which is what keeps the loop usable; the first turn of a session pays the whole 3.4K system prompt.
+
 ## Architectures and backends
 
 `cmake/backends/cuda.cmake` defaults a hand build to `120` and warns about it: that is the RTX 50 card this engine
