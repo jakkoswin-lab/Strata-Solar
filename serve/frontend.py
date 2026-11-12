@@ -2117,6 +2117,71 @@ class JsonOutputParser(OutputParser):
                          declared_only=declared_only, deferred=deferred)
 
 
+def _repair_json_escapes(text: str, aggressive: bool = False) -> str:
+    """Double every backslash that is not the start of a JSON escape.
+
+    `aggressive` also treats \\t \\n \\r \\b \\f as separators when a letter follows: in `C:\\tools` the JSON
+    escape \\t is a tab, and Solar means the folder "tools"."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        nxt = text[i + 1] if i + 1 < n else ""
+        after = text[i + 2] if i + 2 < n else ""
+        if nxt == "u" and i + 6 <= n and all(c in "0123456789abcdefABCDEF" for c in text[i + 2:i + 6]):
+            out.append(text[i:i + 6])
+            i += 6
+        elif nxt in '\\"/':
+            out.append(ch + nxt)
+            i += 2
+        elif nxt in "bfnrt" and not (aggressive and after.isalpha()):
+            out.append(ch + nxt)
+            i += 2
+        else:
+            out.append("\\\\")          # a Windows path separator
+            i += 1
+    return "".join(out)
+
+
+def _has_control(v) -> bool:
+    if isinstance(v, str):
+        return any("\x08" <= ch <= "\x0d" for ch in v)
+    if isinstance(v, dict):
+        return any(_has_control(x) for x in v.values())
+    if isinstance(v, list):
+        return any(_has_control(x) for x in v)
+    return False
+
+
+def json_args(text: str):
+    """`json.loads`, or the same after repairing Windows paths written raw inside the JSON.
+
+    Measured: Solar writes `C:\\tools\\x.py` (single backslashes) inside a call, which is either an illegal
+    escape (the whole call used to fall back to text) or a tab (`\\t`), so the path silently changed.  When the
+    decoded value carries a control character the escapes are read as the separators they were meant to be."""
+    if not text.strip():
+        return {}
+    obj = None
+    try:
+        obj = json.loads(text)
+    except ValueError:
+        try:
+            obj = json.loads(_repair_json_escapes(text))
+        except ValueError:
+            obj = None
+    if obj is not None and _has_control(obj):
+        try:
+            fixed = json.loads(_repair_json_escapes(text, aggressive=True))
+        except ValueError:
+            fixed = None
+        if fixed is not None and not _has_control(fixed):
+            obj = fixed
+    return obj
+
+
 class SolarOutputParser:
     """Solar-Open-100B's own call spelling, as its chat template writes it:
 
@@ -2187,10 +2252,7 @@ class SolarOutputParser:
 
     def _emit_call(self, raw: str) -> list:
         name = self._name.strip().lstrip("=: ").strip()   # measured: a forced call can write "<|tool_call:name|>=shell"
-        try:
-            args = json.loads(self._args) if self._args.strip() else {}
-        except ValueError:
-            args = None
+        args = json_args(self._args)
         # measured: a shell call can arrive with the command as the body instead of a JSON object
         if args is None and name in ("shell", "bash") and self._args.strip() \
                 and not self._args.lstrip().startswith("{"):
@@ -2219,10 +2281,7 @@ class SolarOutputParser:
             name = m.group(1)
             rest = body[m.end():]
             if rest.lstrip().startswith("{"):
-                try:
-                    obj = json.loads(rest)
-                except ValueError:
-                    obj = None
+                obj = json_args(rest)
                 if isinstance(obj, dict) and "name" in obj:
                     name = str(obj["name"])
                     args = obj.get("arguments") or obj.get("parameters") or {}

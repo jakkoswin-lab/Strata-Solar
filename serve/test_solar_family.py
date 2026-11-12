@@ -362,6 +362,34 @@ class ToolNudge(unittest.TestCase):
         self.assertIs(server._solar_tool_nudge(other), other)
 
 
+class ToolArguments(unittest.TestCase):
+    """Measured: Solar writes Windows paths raw inside a call's JSON, so the call used to fall back to text."""
+
+    def test_a_path_with_single_backslashes(self):
+        args = frontend.json_args('{"path": "C:\\Translate\\Novel_1\\a.docx"}')
+        self.assertEqual(args, {"path": r"C:\Translate\Novel_1\a.docx"})
+
+    def test_a_letter_after_a_valid_escape_is_a_separator(self):
+        # "\\t" is a legal escape (a tab), but C:\tools means the folder
+        args = frontend.json_args('{"command": "python C:\\tools\\x.py"}')
+        self.assertEqual(args, {"command": r"python C:\tools\x.py"})
+        self.assertNotIn("\t", args["command"])
+
+    def test_a_real_escape_is_left_alone(self):
+        args = frontend.json_args('{"command": "echo a\\nb\\t"}')
+        self.assertEqual(args, {"command": "echo a\nb\t"})
+
+    def test_the_whole_call_is_read(self):
+        p = frontend.SolarOutputParser(tools=[{"name": "shell"}])
+        raw = ('<|tool_call:begin|>82<|tool_call:name|>shell<|tool_call:args|>'
+               '{"command": "python C:\\Translate\\x.py \\"C:\\\\a\\\\b.txt\\" --start 1"}'
+               '<|tool_call:end|>')
+        calls = [e for e in p.feed(raw) if e.kind == "tool_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].call.arguments,
+                         {"command": 'python C:\\Translate\\x.py "C:\\a\\b.txt" --start 1'})
+
+
 class DropSystemPrompt(unittest.TestCase):
     """The config's "drop_system_prompt": Solar's template writes the tool block itself, and an agent's system prompt
     (OpenCode's code-mode `execute`) pulls it out of its own call format."""

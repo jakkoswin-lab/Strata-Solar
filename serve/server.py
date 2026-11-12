@@ -5089,7 +5089,9 @@ def _solar_tool_nudge(messages: list[dict], docx_tool: str = r"tools\docx_text.p
             note = _reader_note(target, docx_tool, xlsx_tool)
         else:
             # measured: a folder listing that names a .docx/.xlsx is followed by `read` on it, which returns nothing
-            note = SOLAR_AFTER_TOOL + _reader_hint(text, docx_tool, xlsx_tool)
+            # a folder listing is short; a document's own text is not, and must not be read as "a .docx was named"
+            hint = _reader_hint(text, docx_tool, xlsx_tool) if len(text or "") < 600 else ""
+            note = SOLAR_AFTER_TOOL + hint
             # measured: with the novel read, the model answered a review straight away instead of opening the
             # 설정집/가이드 the user named.  The list of what is left rides on the same "call a tool now" turn
             # (without it the model writes a plan and stops); the reader hint is dropped there to keep it short.
