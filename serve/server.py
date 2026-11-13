@@ -10079,6 +10079,14 @@ MODEL_CARD_SAMPLING = {
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
     # DeepSeek-V4.1-Flash: temperature 1.0, top_p 1.0 for local use (thinking or not), no penalties
     "deepseek41": {"thinking": {"temperature": 1.0, "top_p": 1.0}, "instruct": {"temperature": 1.0, "top_p": 1.0}},
+    # Solar-Open-100B (Upstage): greedy with no penalty degenerates on long "point out what is wrong" answers - the
+    # model fills a template with `"X" 대신 "X"` and never stops (measured: 15 identity substitutions, 700 tokens,
+    # finish=length, on a 21-line Korean passage).  A mild pair ends it at 347 tokens with real suggestions; a
+    # presence penalty of 1.5 alone is too strong for translation (it replaced 정안후부 with 후궁 to avoid the
+    # repeat), and 0.5/0.5 leaves the translation unchanged.  Greedy stays: this is a penalty on the logits, so the
+    # same prompt still gives the same reply.
+    "glm4moe": {"thinking": {"frequency_penalty": 0.5, "presence_penalty": 0.5},
+                "instruct": {"frequency_penalty": 0.5, "presence_penalty": 0.5}},
 }
 
 

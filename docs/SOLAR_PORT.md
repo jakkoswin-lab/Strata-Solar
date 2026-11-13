@@ -1146,6 +1146,21 @@ Why translation gets nothing: the table comes from the request's own tokens, whi
 Korean.  A Korean corpus (the previous chapters) would be the next step, and the engine can only take token ids, so
 the server would have to pre-tokenize it.
 
+### The degeneration loop on "point out what is wrong" answers
+
+Greedy decoding on a review request ("find the awkward or wrong parts of this passage") fills a template with
+`"X" 대신 "X"` - the same word as its own replacement - and never stops: measured on a 21-line Korean passage, 700
+tokens to `max_tokens` with 15 identity substitutions.  A sampling penalty fixes it: frequency 0.5 + presence 0.5
+ends the reply at 362 tokens with real suggestions (멍하니 → 멍하게, 덜컥 → 갑자기, 사원 → 사찰, 비구니 → 승려), and the
+same penalties leave a Chinese-to-Korean translation unchanged.  presence 1.5 alone is too strong: to avoid repeating
+정안후부 it wrote 후궁 instead, i.e. it traded accuracy for novelty.
+
+`serve/server.py` now ships that pair as the glm4moe model-card default (`MODEL_CARD_SAMPLING`), so a client that asks
+for nothing gets it; an explicit `temperature`/`presence_penalty` in the request still wins.  Temperature stays 0, so
+the same prompt gives the same answer.  The run config also sets `"reasoning_loop_recovery": "stop"`, which ends a
+reply whose *reasoning* repeats whole passages (a thinking-mode loop the content penalty cannot see) instead of
+running to `max_tokens`.
+
 ## Architectures and backends
 
 `cmake/backends/cuda.cmake` defaults a hand build to `120` and warns about it: that is the RTX 50 card this engine
