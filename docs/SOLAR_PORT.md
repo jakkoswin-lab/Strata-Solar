@@ -1161,6 +1161,28 @@ the same prompt gives the same answer.  The run config also sets `"reasoning_loo
 reply whose *reasoning* repeats whole passages (a thinking-mode loop the content penalty cannot see) instead of
 running to `max_tokens`.
 
+### Where the prompt pass' time goes, and three things that did not help
+
+A 10K-token prompt reads in 82 s (121 tok/s) and the profile puts the time in the matvecs, not in attention: turning
+the prefill attention's value pass off (`STRATA_GLM4_ATTN_SKIP=1`) changes it by 0.5%, and neither the PCIe fetch
+(chunk 512 → 2048: +0.9%) nor the expert cache is on the critical path.  Three attempts at the matvec itself all came
+back slower, and the reasons are worth keeping:
+
+| change | 10K prefill | vs 82.4 s |
+|---|---|---|
+| baseline (`mmvq_multi_kernel`, 8 columns per pass) | 82.2–82.5 s | — |
+| wider column tile (`NC` 16 / 32) | 83.0 / 90.5 s | −1% / −10% |
+| the block's weights decoded once into shared | 95.4 s | −16% |
+| the column tile's q8_1 activations staged in shared | 93.6 s | −14% |
+
+The column tile already amortizes the weight decode, which is why widening it does nothing: the decode is not the
+cost.  Both staging variants pay more in occupancy — 10 to 36 KB of shared per block drops the block to one per SM —
+than they save in traffic.  What is left is the inner loop per (row, column): 8 dp4a plus the per-32 scale math for
+every 32 weights, 128 times per row and column, at about 1–2% of the card's dp4a throughput and 5–10% of its HBM.
+Cutting that needs a tile GEMM on `mma` (16×8×32 int8 into int32, rescaled per 32-block), i.e. a from-scratch
+implementation — the upstream code has none for i-quants (llama.cpp's MMQ covers K-quants and the legacy types), and
+the two failure modes above show how easily the tiling goes wrong on a 16 GB card.
+
 ## Architectures and backends
 
 `cmake/backends/cuda.cmake` defaults a hand build to `120` and warns about it: that is the RTX 50 card this engine
