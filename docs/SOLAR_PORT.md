@@ -1183,6 +1183,27 @@ Cutting that needs a tile GEMM on `mma` (16×8×32 int8 into int32, rescaled per
 implementation — the upstream code has none for i-quants (llama.cpp's MMQ covers K-quants and the legacy types), and
 the two failure modes above show how easily the tiling goes wrong on a 16 GB card.
 
+### The dense prompt matvec on the tensor cores (`STRATA_GLM4_GEMM=0` turns it off)
+
+`iq_mmvq` decodes a weight block once per 8 columns, so a 512-row chunk decodes the same *dense* weights 64 times.
+Measured on this card: 100 T MAC/s through `mma.m16n8k32` and 0.15 T MAC/s through `iq_mmvq`, i.e. the prompt matvec
+runs at 0.15% of the tensor cores.  An i-quant dense matrix is small enough to transcode, so `mm()` now dequantises
+the matrix (`iq_dequant_f16`, device-side) and the chunk's activations to fp16 and multiplies them with cuBLAS:
+
+| | before | after |
+|---|---|---|
+| one 4160×4096 matrix, 512 rows | ~30 ms | **1.03 ms** (transcode 0.67 + GEMM 0.36) |
+| 10K-token prefill | 82.4 s | **67.1 s (−18.5%)** |
+| logits after a 1,876-token prompt | — | same argmax, top-10 identical, max Δ 0.40 (fp16 vs the int8 dot) |
+| VRAM | — | +72 MiB matrix scratch + 8 MiB activations |
+
+The scratch is sized from the widest dense matrix of the model and the prompt chunk; a matrix that does not fit, a type
+that `iq_dequant_f16` does not read (Q4_K, Q5_K - `attn_v` is Q4_K and keeps `iq_mmvq`), a short chunk (fewer than 32
+columns) and decode all keep the old path.
+
+The gain is smaller than the 1.03 ms suggests because the dense matvec was only ~18 s of the 82 s: the rest is the
+routed experts (whose weights change every token, so nothing can be transcoded ahead) and attention.
+
 ## Architectures and backends
 
 `cmake/backends/cuda.cmake` defaults a hand build to `120` and warns about it: that is the RTX 50 card this engine

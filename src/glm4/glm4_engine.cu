@@ -21,6 +21,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/qwen35/sampling.hpp"
 
+#include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -1138,6 +1139,13 @@ struct Lookup {
     }
 };
 
+/// fp32 -> fp16 for the cuBLAS prompt GEMM: the matvec's activations arrive as fp32 rows.
+__global__ void k_f32_to_f16(const float* __restrict__ src, __half* __restrict__ dst, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(src[i]);
+}
+
+// ------------------------------------------------------------------------------------------------ the engine
 float* dalloc(size_t n) {
     float* p = nullptr;
     CK(cudaMalloc(&p, n * 4));
@@ -1302,6 +1310,17 @@ struct Engine {
     std::vector<void*> kc, vc;             // __half* or int8_t* (STRATA_GLM4_KV_INT8)
     std::vector<__half*> ksc, vsc;         // the per-(head, position) scales; null on the half path
     bool kv_i8 = false;
+    // ---- prompt GEMM on the tensor cores -------------------------------------------------------------------
+    // iq_mmvq decodes a weight block once per 8 columns, so a 512-row chunk decodes the same weights 64 times and the
+    // prompt pass runs at ~0.15% of the card's dp4a throughput.  An i-quant dense matrix is small enough to transcode
+    // to fp16 once per chunk and multiply with cuBLAS: measured on a 4160x4096 matrix with 512 rows, transcode 0.67 ms
+    // + GEMM 0.36 ms against ~30 ms through iq_mmvq.  Decode (ncols == 1) keeps the old path.
+    cublasHandle_t blas = nullptr;
+    bool blas_on = false;
+    void* wf16 = nullptr;      // the matrix being transcoded, [n_in][n_out] fp16
+    void* xf16 = nullptr;      // the chunk's activations, [n_in][cols] fp16
+    size_t wf16_cap = 0, xf16_cap = 0;
+    int blas_min_cols = 32;
     std::vector<HostMat> hq, hk, hv, ho, hg, hu, hd, hsg, hsu, hsd;
     struct Sess {
         std::vector<void*> kc, vc;
@@ -1445,6 +1464,41 @@ struct Engine {
         wts = dalloc(T * Kp);
         logits = dalloc((size_t) 8 * g.n_vocab);
         d_pick = dalloc_t<int32_t>(8);   // the speculative verify's per-row argmax
+        // The widest dense matvec decides the fp16 scratch.  STRATA_GLM4_GEMM=0 falls back to iq_mmvq everywhere;
+        // STRATA_GLM4_GEMM_MIB caps the matrix scratch (a matrix that does not fit keeps the old path).
+        blas_on = std::getenv("STRATA_GLM4_GEMM") == nullptr;
+        if (blas_on && cublasCreate(&blas) == CUBLAS_STATUS_SUCCESS) {
+            size_t need = 0, max_k = 0;
+            auto take = [&](const Mat& M) {
+                if (!M.d) return;
+                need = std::max(need, (size_t) M.n_in * (size_t) M.n_out * 2);
+                max_k = std::max(max_k, (size_t) M.n_in);
+            };
+            for (const Layer& L : m->layers) {
+                take(L.wq);
+                take(L.wk);
+                take(L.wv);
+                take(L.wo);
+                take(L.qk);
+                take(L.sh_gate);
+                take(L.sh_up);
+                take(L.sh_down);
+            }
+            wf16_cap = need;
+            xf16_cap = (size_t) tmax * max_k * 2;
+            if (cudaMalloc(&wf16, wf16_cap) != cudaSuccess || cudaMalloc(&xf16, xf16_cap) != cudaSuccess) {
+                std::fprintf(stderr, "strata-glm4: no VRAM for the fp16 prompt scratch (%.0f MiB); keeping iq_mmvq\n",
+                             (double) (wf16_cap + xf16_cap) / 1048576.0);
+                wf16_cap = xf16_cap = 0;
+                blas_on = false;
+            } else {
+                std::fprintf(stderr, "strata-glm4: prompt GEMM on the tensor cores: fp16 scratch %.0f MiB "
+                                     "(matrix) + %.0f MiB (activations)\n",
+                             (double) wf16_cap / 1048576.0, (double) xf16_cap / 1048576.0);
+            }
+        } else {
+            blas_on = false;
+        }
         CK(cudaMalloc(&q8, q8_bytes((int64_t) (T * N + N)) + 4096));
         CK(cudaMalloc(&q8d, q8_bytes((int64_t) T * Kp * FF) + 4096));
         if (m->experts_host) {
@@ -1642,7 +1696,26 @@ struct Engine {
     }
 
     /// out[col] = W . x[col] on iq_mmvq, `cols` columns of n_in values (packed).
+    /// The i-quants iq_dequant_f16 reads (16..23 and IQ1_M): the ones this GEMM path can transcode.
+    static bool blas_type(int t) { return (t >= 16 && t <= 23) || t == 29; }
+
     void mm(const Mat& w, const float* xin, float* out, int cols) {
+        // prompt chunks: transcode this matrix and the chunk to fp16, then one tensor-core GEMM
+        if (blas_on && cols >= blas_min_cols && blas_type(w.type) &&
+            (size_t) w.n_in * (size_t) w.n_out * 2 <= wf16_cap && (size_t) w.n_in * (size_t) cols * 2 <= xf16_cap) {
+            const int64_t n = (int64_t) w.n_in * w.n_out;
+            strata::kernels::iq_dequant_f16(w.type, w.d, n, (uint16_t*) wf16, st);
+            const int64_t xn = (int64_t) w.n_in * cols;
+            k_f32_to_f16<<<(unsigned) ((xn + 255) / 256), 256, 0, st>>>(xin, (__half*) xf16, xn);
+            if (cublasSetStream(blas, st) == CUBLAS_STATUS_SUCCESS) {
+                const float one = 1.0f, zero = 0.0f;
+                const cublasStatus_t bs = cublasGemmEx(
+                    blas, CUBLAS_OP_T, CUBLAS_OP_N, w.n_out, cols, w.n_in, &one, wf16, CUDA_R_16F, w.n_in, xf16,
+                    CUDA_R_16F, w.n_in, &zero, out, CUDA_R_32F, w.n_out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+                if (bs == CUBLAS_STATUS_SUCCESS) return;
+            }
+            std::fprintf(stderr, "strata-glm4: cublas GEMM failed, using iq_mmvq for this matrix\n");
+        }
         if (!strata::kernels::iq_supported(w.type)) {
             if (w.type == T_F32) {
                 k_gemv_f32_rows<<<dim3(w.n_out, cols), kThreads, 0, st>>>((const float*) w.d, xin, out, w.n_in, w.n_out, w.n_in);

@@ -514,7 +514,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # strata-glm4 wraps on its own.
   add_library(strata_glm4 STATIC src/glm4/glm4_engine.cu)
   target_include_directories(strata_glm4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(strata_glm4 PRIVATE strata_kernels strata_warnings ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_glm4 PRIVATE strata_kernels strata_warnings ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   # what one i-quant matvec costs at Solar's expert shapes (4096x1280, 1..8 columns)
   add_executable(glm4_mmvq_bench tools/glm4/mmvq_bench.cpp)
   target_include_directories(glm4_mmvq_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
