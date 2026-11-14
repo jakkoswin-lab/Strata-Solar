@@ -1204,6 +1204,46 @@ columns) and decode all keep the old path.
 The gain is smaller than the 1.03 ms suggests because the dense matvec was only ~18 s of the 82 s: the rest is the
 routed experts (whose weights change every token, so nothing can be transcoded ahead) and attention.
 
+### The routed experts at prompt shape: three kernels measured (`tools/glm4/expert_paths_bench.cu`)
+
+A 512-row chunk spreads over at most 128 distinct experts, so one expert sees ~24 rows and its weights can never be
+transcoded ahead of the token that routes to it.  Per expert (gate|up 2560x4096 + down 4096x1280, 16 blobs cycled so
+the weights come from HBM rather than L2):
+
+| rows | `iq_mmvq` (today) | transcode + cuBLAS | `gemm_iq_f16_grouped` (the repo's unused Volta kernel) |
+|---|---|---|---|
+| 8 | 0.059 ms (102 GB/s) | 0.103 ms | 0.237 ms (25 GB/s) |
+| 16 | 0.113 ms (53 GB/s) | 0.105 ms (1.1x) | 0.238 ms (25 GB/s) |
+| 24 | 0.169 ms (36 GB/s) | 0.128 ms (1.3x) | 0.240 ms (24 GB/s) |
+| 32 | 0.224 ms (27 GB/s) | 0.108 ms (2.1x) | 0.241 ms (24 GB/s) |
+
+What the numbers mean:
+
+- The fp16 copy is what costs.  5.7 MB of IQ3 becomes 30 MB of fp16, so the transcode is bandwidth-bound at ~365 GB/s
+  (measured separately: 0.034 ms per 1.9 MB gate with 16-byte stores; the *same* kernel with 2-byte stores runs at
+  61 GB/s, which is what the old flat dequantizer did) and the GEMM itself is 0.02 ms of noise.  At 24 rows the
+  whole exchange is worth only 1.3x.
+- `gemm_iq_f16_grouped` dequantizes into shared memory, so it needs no fp16 copy at all, but a per-group launch is
+  only `n_out / 128` = 20 blocks, i.e. 20 of the card's 36 SMs, and its cost is flat in the row count: 25 GB/s.
+  Making it pay needs a per-expert weight-pointer table and a grid that covers the whole card - a new kernel, and its
+  ceiling is the 5.7 MB read, not the tensor cores.
+- At decode's one row, `iq_mmvq` already streams at 252 GB/s (0.024 ms per expert).  A warp-per-row vectorized dot
+  written to beat it is *slower* (132 GB/s) and bit-identical, so load width is not what limits a single row.
+
+### Where a 10K decode actually goes
+
+| | ms/token | note |
+|---|---|---|
+| decode at 1,141-token context | 33.2 | fixed cost per token |
+| decode at 9,961-token context | 43.0 | +1.11 ms per 1,000 tokens of context (attention + KV reads) |
+| ... with `NOFETCH` (no expert copies) | 38.3 | the PCIe fill costs 4.7 ms of wall time: it is already overlapped |
+| ... with `STRATA_GLM4_NOGRAPH=1` | 44.8 | the captured graph is worth 1.8 ms |
+| routed experts (measured, both projections) | ~5 - 7 | `iq_mmvq_ptrs` at 8 experts/layer, 376+300 GB/s |
+
+So the expert matvec is ~12% of decode and ~17 s of a 67 s prefill: the tensor-core expert kernel is not where the
+remaining time is.  The levers that are left are the attention kernel at long context (11 ms of the 43 at 10K, and it
+grows with every 1,000 tokens) and the ~25 ms/token that no matvec accounts for.
+
 ## Architectures and backends
 
 `cmake/backends/cuda.cmake` defaults a hand build to `120` and warns about it: that is the RTX 50 card this engine
