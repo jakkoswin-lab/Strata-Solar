@@ -43,7 +43,10 @@ class ReleaseManifest(unittest.TestCase):
         m = rm.load()
         self.assertEqual(rm.check(m), [])
         wrong = copy.deepcopy(m)
-        wrong["control_version"] = m["engine_version"]              # the manifest says the hotfix is not there, the source says it is
+        # any value that differs from the CMake source; this used to be the engine version, which only worked while the
+        # manifest carried a Control hotfix (0.1.59.1 against 0.1.59).  A fork whose Control and engine are the same
+        # build has no such pair, so name an impossible version instead.
+        wrong["control_version"] = "0.0.1"                          # the manifest says the hotfix is not there, the source says it is
         problems = "\n".join(rm.check(wrong))
         self.assertIn("CMakeLists.txt (Control) says", problems)
         wrong = copy.deepcopy(m)
