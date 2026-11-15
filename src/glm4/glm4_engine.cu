@@ -1919,7 +1919,9 @@ struct Engine {
         const bool dbg = std::getenv("STRATA_GLM4_DEBUG") != nullptr;
         if (dbg) std::fprintf(stderr, "glm4: forward n=%d pos0=%lld\n", n, (long long) pos0);
         // profiling of a decode step (n == 1 only): one event per stage boundary, deltas summed into buckets
-        const bool pf = prof;   // TEMP: profile the prefill buckets too
+        const bool pf = prof && n == 1;   // decode only: a prefill chunk's buckets are ~3 s and were being divided
+                                          // by the decode token count, which is what made every total here look
+                                          // like 500 ms/token
         if (pf) pei = 0;
         auto mark = [&]() {
             if (pf) CK(cudaEventRecord(pev[(size_t) pei++], st));

@@ -1249,9 +1249,35 @@ Two caveats that apply to every other decode number in this file:
 - `NOFETCH` (no expert copies at all) was 38.3 against 43.0 under the profiler, so the PCIe fill costs ~4.7 ms of
   wall time and is already overlapped by the rest of the step.
 
-So at 10K: attention ~8 ms, experts ~5-6 ms, dense projections + shared expert + head ~13 ms, ~2 ms everything else.
-The expert matvec is the same order as the dense weights, which is why the tensor-core expert work above was a dead
-end for decode.
+### The decode stage profile, per bucket (9,961 positions, 120 tokens)
+
+The profiler used to sum a prefill chunk's buckets (3 s each) and then divide by the *decode* token count, which is
+why the totals here used to read ~530 ms/token.  It now accumulates decode forwards only (`n == 1`), and the buckets
+add up to what the engine reports:
+
+| bucket | ms/token | share | of which |
+|---|---|---|---|
+| attn | 17.16 | 44% | scores 5.87, values 2.71, softmax 0.98, combine 0.22, **q/k/v/o projections ~7.4** |
+| gate/up | 13.59 | 35% | **k_fetch 7.20** (overlapped PCIe fill), k_resolve 0.73, the matvec ~5.7 |
+| down | 3.05 | 8% | |
+| shared (expert) | 2.02 | 5% | |
+| router | 1.82 | 5% | rms 0.70, gemv 0.47, top-k 0.54 |
+| head | 1.36 | 3% | |
+| embed | 0.08 | 0% | |
+| **total** | **39.09** | | against 28.1 with the graph: ~11 ms of launch gaps are what the graph covers |
+
+So the "25 ms that no matvec accounts for" does not exist: ~11 ms of it was launch gaps (hidden by the graph) and
+the rest was the division bug.  What is really left at 10K, in the graphed 28.1 ms:
+
+- attention kernels **9.8 ms** - scores alone is 5.87 (122 us a layer for 10.5 MB of K and 3.9 MB of scores, i.e.
+  ~2.5 GB/s: the QK dots are now instruction-bound, two shared-memory operands per fma, not bandwidth-bound)
+- dense projections, shared expert and head **10.8 ms**
+- routed expert matvecs **8.7 ms** (376 + 300 GB/s in the bench: near the card's floor)
+- router, norms, sampling **1.9 ms**
+
+The next lever is the scores kernel's arithmetic (half2 or int8 dot products instead of one fp32 fma per two
+shared reads), worth up to 4 ms/token; after that the dense projections at one column, which the bench measures at
+123-175 GB/s against 300+ for the same weights with eight columns.
 
 ### The decode attention kernels: 16-byte cache reads (bit-exact, `STRATA_GLM4_ATTN=fast` path unchanged)
 
