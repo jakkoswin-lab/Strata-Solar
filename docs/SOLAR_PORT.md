@@ -1398,6 +1398,28 @@ So the four-way split is the right shape on this card: the score matrix's 2.6 MB
 serialisation a single block needs to avoid it.  Both fused kernels stay in the tree behind
 `STRATA_GLM4_ATTN_FUSED` and both stay off.
 
+### Directions that were measured and rejected (so they are not tried again)
+
+Everything below was built and timed on this card, not estimated.  The numbers are the decode at 9,961 positions
+unless stated; the shipped path is 24.0 ms/token.
+
+| direction | what it measured | why it loses |
+|---|---|---|
+| fuse the four attention kernels, 128-position tiles | 32.7 ms/token | 47 KiB of shared memory leaves four blocks an SM, and one block must run scores, then softmax, then values |
+| the same with 64-position tiles and 256 threads | 28.1 ms/token | 30 KiB and seven blocks an SM is better, still behind, and no longer bit-identical |
+| KV cache in int4, one scale per head+position | -1 to -1.5 ms/token | the attention output moves 71% (relative RMS); the int8 cache we ship moves 0.94% |
+| KV cache in int4, one scale per 32 values | -1 ms/token | 9.9%, an order of magnitude worse than int8, for ~4% of the step |
+| the shared expert on a second stream, overlapping the routed experts | 0 ms with the graph, +2.4 ms without | both chains stream weights, so overlapping moves no bytes; the two event syncs cost what the overlap saves |
+| merge the ~20 kernels a layer into 5-6 | ~0.7-1 ms | a graph node costs 0.60 us (measured: a graph of 1000 empty kernels against a graph of one), so 14 fewer launches a layer is 0.41 ms; the rest of the estimate was "small kernels do not fill the GPU", which the overlap above shows is not how this machine behaves |
+| repack the weights to int8 / fp8 | negative | IQ3_XXS is 0.383 B/weight; int8 with per-32 scales is 1.125, fp8 is 1.0 |
+| IQ2_S for the routed experts | -0.9 ms of bytes | measured *slower* per byte (16.8 against 22 tok/s) and the answers degrade |
+| speculative prompt-lookup decode | 1.44x on text that repeats the prompt, 1.0x on translation | the drafting only hits when the output is a copy of the input |
+
+The common thread: at 5.5 GB of weights and KV a token the step is a streaming problem, and every one of these
+either moves the same bytes faster-looking (but not actually fewer) or buys bytes with quality.  What is left is
+model-level (a smaller or lower-precision official quantisation) or hardware-level (24 GB would cut the expert-cache
+fill, two cards would split the weights); the kernel-level work on this shape is done.
+
 ## Architectures and backends
 
 `cmake/backends/cuda.cmake` defaults a hand build to `120` and warns about it: that is the RTX 50 card this engine
