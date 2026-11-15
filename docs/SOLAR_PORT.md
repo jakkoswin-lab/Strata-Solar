@@ -1358,6 +1358,17 @@ Two things it taught, both now in the code: the score tile's stride must be a mu
 captured CUDA graph freezes the launch arguments (a host-side tile count stopped attending to positions added after
 capture - the first version produced a plausible-looking loop of repeated tokens that way).
 
+A second shape (`STRATA_GLM4_ATTN_FUSED=2`) attacks the two causes directly: 64-position tiles (17.4 KiB of K tile,
+four score slots, 30 KiB of shared, so seven blocks fit an SM) and 256 threads with two threads per dim, each
+accumulating half the tile and merged at the end.  It gets to **28.1 ms/token** - better than the 128-position
+version, still 13% behind the four kernels - and its rounding is no longer bit-identical: the 64-position online
+softmax and the two position halves summed separately change the order, and the number list it generates drops the
+comma tokens after the third step.
+
+So the four-way split is the right shape on this card: the score matrix's 2.6 MB round trip is cheaper than the
+serialisation a single block needs to avoid it.  Both fused kernels stay in the tree behind
+`STRATA_GLM4_ATTN_FUSED` and both stay off.
+
 ## Architectures and backends
 
 `cmake/backends/cuda.cmake` defaults a hand build to `120` and warns about it: that is the RTX 50 card this engine

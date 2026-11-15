@@ -857,6 +857,185 @@ __global__ void k_attn_flash_dec(const float* qk, const KT* kc, const KT* vc, co
     }
 }
 
+/// The same fused pass with 64-position tiles and 256 threads: the shared footprint drops from 47 KiB to 30 (q 4,
+/// K tile 17.4, four score slots 4, the upper halves' accumulators 4), so seven blocks fit an SM instead of four, and
+/// the V accumulation gets two threads per dim (each half the tile's positions, merged at the end).  That is what the
+/// 128-position/128-thread version above was missing: 32.7 ms/token against the four kernels' 24.9.
+template <class KT>
+__global__ void k_attn_flash_dec2(const float* qk, const KT* kc, const KT* vc, const __half* ksc, const __half* vsc,
+                                  float* part, float* pmax, float* psum, int H, int HKV, int D, int ctx,
+                                  const int64_t* pos0p, float scale, int nsplits) {
+    constexpr int PT = 64;   // positions per tile: 4 score groups of 16, and D == 128 so 256 threads are 2 a dim
+    const int n_pos = (int) (*pos0p) + 1;
+    __shared__ __align__(32) __half qsh[16][128];
+    __shared__ __align__(32) __half tile[PT][136];
+    __shared__ __align__(32) float so[PT / 16][256];
+    __shared__ float red[8][8];
+    __shared__ float half[8][128];
+    __shared__ float msh[8], ssh[8];
+    const int kvh = blockIdx.x, sp = blockIdx.y;
+    const int n_now = (n_pos + PT - 1) / PT;
+    const int t0 = (int) ((long long) n_now * sp / nsplits);
+    const int t1 = (int) ((long long) n_now * (sp + 1) / nsplits);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, R = H / HKV;
+    const int nwarp = (int) blockDim.x >> 5;
+    const int d = tid & 127, up = tid >> 7;   // two threads per dim: positions [0, PT/2) and [PT/2, PT)
+    constexpr int pwarps = PT / 32;
+    const KT* kb = kc + (size_t) kvh * ctx * D;
+    const KT* vb = vc + (size_t) kvh * ctx * D;
+    const __half* ks = ksc ? ksc + (size_t) kvh * ctx : nullptr;
+    const __half* vs = vsc ? vsc + (size_t) kvh * ctx : nullptr;
+    float acc[8], mrun[8], srun[8];
+#pragma unroll
+    for (int h = 0; h < 8; ++h) {
+        acc[h] = 0.f;
+        mrun[h] = -INFINITY;
+        srun[h] = 0.f;
+    }
+    for (int i = tid; i < 16 * D; i += (int) blockDim.x) {
+        const int r = i / D, e = i - r * D;
+        qsh[r][e] = r < R ? __float2half(qk[(size_t) kvh * R * D + (size_t) r * D + e]) : __float2half(0.f);
+    }
+    for (int t = t0; t < t1; ++t) {
+        const int p0 = t * PT;
+        const int rows = min(PT, n_pos - p0);
+        {
+            constexpr int kVec = 16;
+            const int vpp = kVec / (int) sizeof(KT), chunks = D / vpp, pps = (int) blockDim.x / chunks;
+            const int c = (tid % chunks) * vpp;
+            for (int i = tid / chunks; i < PT; i += pps) {
+                const bool ok = p0 + i < n_pos;
+                uint4 raw = make_uint4(0, 0, 0, 0);
+                if (ok) memcpy(&raw, &kb[(size_t) (p0 + i) * D + c], kVec);
+                __half* o = tile[i] + c;
+                if constexpr (sizeof(KT) == 1) {
+                    const float sc = (ok && ks) ? __half2float(ks[p0 + i]) : 1.f;
+                    const int8_t* b = reinterpret_cast<const int8_t*>(&raw);
+#pragma unroll
+                    for (int j = 0; j < 16; ++j) o[j] = __float2half((float) b[j] * sc);
+                } else {
+                    const __half* hv = reinterpret_cast<const __half*>(&raw);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) o[j] = ok ? hv[j] : __float2half(0.f);
+                }
+            }
+        }
+        __syncthreads();
+        for (int g = warp; g < PT / 16; g += nwarp) {
+            nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> a;
+            nvcuda::wmma::fill_fragment(a, 0.f);
+            for (int k0 = 0; k0 < D; k0 += 16) {
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major> fa;
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::col_major> fb;
+                nvcuda::wmma::load_matrix_sync(fa, &qsh[0][k0], 128);
+                nvcuda::wmma::load_matrix_sync(fb, &tile[g * 16][k0], 136);
+                nvcuda::wmma::mma_sync(a, fa, fb, a);
+            }
+            nvcuda::wmma::store_matrix_sync(so[g], a, 16, nvcuda::wmma::mem_row_major);
+        }
+        __syncthreads();
+        const int sg = tid >> 4, spp = tid & 15;
+        const bool owns = tid < PT;
+        if (owns) {
+            const bool has = tid < rows;
+#pragma unroll
+            for (int h = 0; h < 8; ++h) so[sg][h * 16 + spp] = has ? so[sg][h * 16 + spp] * scale : -INFINITY;
+        }
+        __syncthreads();
+        if (owns) {
+            float tm[8];
+#pragma unroll
+            for (int h = 0; h < 8; ++h) {
+                float x = so[sg][h * 16 + spp];
+#pragma unroll
+                for (int o = 16; o; o >>= 1) x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, o));
+                tm[h] = x;
+            }
+            if (lane == 0)
+#pragma unroll
+                for (int h = 0; h < 8; ++h) red[warp][h] = tm[h];
+        }
+        __syncthreads();
+        if (tid < 8) {
+            float x = red[0][tid];
+            for (int w = 1; w < pwarps; ++w) x = fmaxf(x, red[w][tid]);
+            red[0][tid] = x;
+        }
+        __syncthreads();
+        float corr[8];
+#pragma unroll
+        for (int h = 0; h < 8; ++h) {
+            const float mn = fmaxf(mrun[h], red[0][h]);
+            corr[h] = __expf(mrun[h] - mn);
+            mrun[h] = mn;
+        }
+#pragma unroll
+        for (int h = 0; h < 8; ++h) {
+            acc[h] *= corr[h];
+            srun[h] *= corr[h];
+        }
+        if (owns)
+#pragma unroll
+            for (int h = 0; h < 8; ++h)
+                so[sg][h * 16 + spp] =
+                    so[sg][h * 16 + spp] == -INFINITY ? 0.f : __expf(so[sg][h * 16 + spp] - mrun[h]);
+        __syncthreads();
+        if (owns) {
+            float ts[8];
+#pragma unroll
+            for (int h = 0; h < 8; ++h) {
+                float x = so[sg][h * 16 + spp];
+#pragma unroll
+                for (int o = 16; o; o >>= 1) x += __shfl_xor_sync(0xffffffffu, x, o);
+                ts[h] = x;
+            }
+            if (lane == 0)
+#pragma unroll
+                for (int h = 0; h < 8; ++h) red[warp][h] = ts[h];
+        }
+        __syncthreads();
+        if (tid < 8) {
+            float x = red[0][tid];
+            for (int w = 1; w < pwarps; ++w) x += red[w][tid];
+            red[0][tid] = x;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int h = 0; h < 8; ++h) srun[h] += red[0][h];
+        const int lo = up ? PT / 2 : 0, hi = min(PT, rows);
+        for (int p = lo; p < hi; ++p) {
+            const float v = kv_load(&vb[(size_t) (p0 + p) * D + d], vs ? __half2float(vs[p0 + p]) : 1.f);
+            const float* pr = so[p >> 4] + (p & 15);
+#pragma unroll
+            for (int h = 0; h < 8; ++h) acc[h] = fmaf(pr[h * 16], v, acc[h]);
+        }
+        __syncthreads();   // score slots are rewritten by the next tile
+    }
+    if (up) {
+#pragma unroll
+        for (int h = 0; h < 8; ++h) half[h][d] = acc[h];
+    }
+    __syncthreads();
+    if (tid == 0) {
+#pragma unroll
+        for (int h = 0; h < 8; ++h) {
+            msh[h] = mrun[h];
+            ssh[h] = srun[h];
+        }
+    }
+    __syncthreads();
+    if (!up) {
+#pragma unroll
+        for (int h = 0; h < R; ++h) acc[h] += half[h][d];
+        for (int h = 0; h < R; ++h)
+            part[((size_t) (kvh * R + h) * nsplits + sp) * D + d] = acc[h];
+        if (tid < R) {
+            pmax[(size_t) (kvh * R + tid) * nsplits + sp] = msh[tid];
+            psum[(size_t) (kvh * R + tid) * nsplits + sp] = ssh[tid];
+        }
+    }
+}
+
 /// Merge the fused splits: out = sum_s part_s * exp(max_s - M) / sum_s sum_s * exp(max_s - M).
 __global__ void k_attn_combine_f(const float* part, const float* pmax, const float* psum, float* out, int H, int D,
                                  int nsplits, int qstride) {
@@ -1462,7 +1641,7 @@ struct Engine {
     // a CPU reference agrees to 0.02% - but slower: 32.7 ms/token against 24.9 at 9,961 positions.  Its 51 KiB of
     // shared memory leaves 4 blocks an SM, and its 128 threads have to do the scores and the V accumulation in turn,
     // where the four kernels get 256 threads for the scores and 8 KiB a block for the values.  Off by default.
-    bool att_fused = false;   // STRATA_GLM4_ATTN_FUSED=1: the fused flash-decoding pass instead of the four kernels
+    int att_fused = 0;   // STRATA_GLM4_ATTN_FUSED=1|2: the fused pass instead of the four kernels
     int att_splits = 32;   // STRATA_GLM4_ATTN_SPLITS: position splits for the value accumulation
     bool att_gemm = false;   // force the GEMM path
     int att_thresh = 640;    // ... or use it once the context passes this many positions (STRATA_GLM4_ATTN=fast disables)
@@ -1696,8 +1875,7 @@ struct Engine {
         if (const char* v = std::getenv("STRATA_GLM4_ATTN_SKIP")) attn_skip = std::atoi(v);
         att_flash = std::getenv("STRATA_GLM4_NO_ATTN_FLASH") == nullptr;
         att_tc = std::getenv("STRATA_GLM4_ATTN_TC") == nullptr || std::atoi(std::getenv("STRATA_GLM4_ATTN_TC")) != 0;
-        att_fused = std::getenv("STRATA_GLM4_ATTN_FUSED") != nullptr &&
-                    std::atoi(std::getenv("STRATA_GLM4_ATTN_FUSED")) != 0;
+        att_fused = std::getenv("STRATA_GLM4_ATTN_FUSED") ? std::atoi(std::getenv("STRATA_GLM4_ATTN_FUSED")) : 0;
         // STRATA_GLM4_KV_INT8: the cache holds one int8 per value plus a per-(head, position) scale, so it takes
         // half the VRAM and the expert cache grows.  Only the GEMM decode and flash prompt kernels carry it, so the
         // decode threshold is dropped to 0 and the flash path is forced (the older kernels stay half-only).
@@ -2265,7 +2443,20 @@ struct Engine {
                 if (l == 0 && std::getenv("STRATA_GLM4_ATTN_DBG"))
                     std::fprintf(stderr, "fused dbg: n=%lld pos_stage=%lld n_tiles=%d fsplit=%d nsplits=%d\n",
                                  (long long) n, (long long) pos_stage, n_tiles_now, fsplit, nsplits);
-                if (att_fused) {
+                if (att_fused >= 2) {
+                    // 64-position tiles and 256 threads: seven blocks an SM, two threads per dim
+                    if (kv_i8)
+                        k_attn_flash_dec2<int8_t><<<dim3(HKV, fsplit), 256, 0, st>>>(
+                            qkf, (const int8_t*) kc[(size_t) l], (const int8_t*) vc[(size_t) l], ksc[(size_t) l],
+                            vsc[(size_t) l], att_part, att_pmax, att_psum, H, HKV, D, ctx, d_pos, scale, fsplit);
+                    else
+                        k_attn_flash_dec2<__half><<<dim3(HKV, fsplit), 256, 0, st>>>(
+                            qkf, (const __half*) kc[(size_t) l], (const __half*) vc[(size_t) l], nullptr, nullptr,
+                            att_part, att_pmax, att_psum, H, HKV, D, ctx, d_pos, scale, fsplit);
+                    if (pf) CK(cudaEventRecord(ea[1], st));
+                    k_attn_combine_f<<<H, D, 0, st>>>(att_part, att_pmax, att_psum, att, H, D, fsplit, D);
+                    if (pf) CK(cudaEventRecord(ea[4], st));
+                } else if (att_fused == 1) {
                     // one pass: K and V read once each, no score matrix (flash-decoding)
                     if (kv_i8)
                         k_attn_flash_dec<int8_t><<<dim3(HKV, fsplit), 128, 0, st>>>(
