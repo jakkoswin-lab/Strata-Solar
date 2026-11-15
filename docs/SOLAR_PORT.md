@@ -1258,13 +1258,18 @@ add up to what the engine reports:
 | bucket | ms/token | share | of which |
 |---|---|---|---|
 | attn | 17.16 | 44% | scores 5.87, values 2.71, softmax 0.98, combine 0.22, **q/k/v/o projections ~7.4** |
-| gate/up | 13.59 | 35% | **k_fetch 7.20** (overlapped PCIe fill), k_resolve 0.73, the matvec ~5.7 |
+| gate/up | 13.59 | 35% | k_fetch 7.20 (see the caveat), k_resolve 0.73, the matvec ~5.7 |
 | down | 3.05 | 8% | |
 | shared (expert) | 2.02 | 5% | |
 | router | 1.82 | 5% | rms 0.70, gemv 0.47, top-k 0.54 |
 | head | 1.36 | 3% | |
 | embed | 0.08 | 0% | |
 | **total** | **39.09** | | against 28.1 with the graph: ~11 ms of launch gaps are what the graph covers |
+
+The `k_fetch` span is not the copy's duration - it brackets the launch of a kernel on the same stream, and the
+misses it reports (132.6 blobs, 799 MB a token) would be 27 GB/s if spread over the whole step, i.e. at the link's
+limit.  The reliable number is the `NOFETCH` ablation: the fill costs ~4.7 ms of wall time and the rest of the step
+hides it.
 
 So the "25 ms that no matvec accounts for" does not exist: ~11 ms of it was launch gaps (hidden by the graph) and
 the rest was the division bug.  What is really left at 10K, in the graphed 28.1 ms:
