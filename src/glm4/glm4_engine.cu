@@ -163,40 +163,43 @@ __global__ void k_route_topk(const float* __restrict__ logits, const float* __re
         score[i] = p + bias[i];
     }
     __syncthreads();
-    if (threadIdx.x != 0) return;
+    if (threadIdx.x >= 32) return;   // one warp picks the eight
     const int k = Kp < 8 ? Kp : 8;
-    // The best eight live in registers.  This used to be a dynamically indexed int[32]/float[32], which the compiler
-    // puts in local memory - a single thread doing ~1100 dependent local-memory accesses cost **48 us per layer**
-    // (2.3 ms/token), more than the rest of the router put together.  Slots are filled with -inf/INT_MAX so a new
-    // entry can always be dropped into the last slot and bubbled up with compile-time indices.
-    float tv[8];
-    int ti[8];
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        tv[j] = -INFINITY;
-        ti[j] = 0x7fffffff;
-    }
-    for (int i = 0; i < lim; ++i) {
-        const float v = score[i];
-        if (!(v > tv[7] || (v == tv[7] && i < ti[7]))) continue;
-        tv[7] = v;
-        ti[7] = i;
-#pragma unroll
-        for (int j = 7; j > 0; --j) {
-            if (tv[j] > tv[j - 1] || (tv[j] == tv[j - 1] && ti[j] < ti[j - 1])) {
-                const float a = tv[j - 1];
-                tv[j - 1] = tv[j];
-                tv[j] = a;
-                const int b = ti[j - 1];
-                ti[j - 1] = ti[j];
-                ti[j] = b;
+    // Eight warp-argmax rounds: each lane scans its strided quarter of the experts for the best (score, then the
+    // lower index), five shuffles combine the 32, and the winner is struck out in shared memory.  The order is the
+    // insertion sort's - the same eight experts, descending, ties to the lower index - so ids and weights are
+    // unchanged; a lane's work is ~25 instructions a round against one thread's 128-step dependent walk.
+    const int lane = threadIdx.x;
+    float sel_v[8];
+    int sel_i[8];
+    for (int r = 0; r < 8; ++r) {
+        float bv = -INFINITY;
+        int bi = 0x7fffffff;
+        for (int i = lane; i < lim; i += 32) {
+            const float v = score[i];
+            if (v > bv || (v == bv && i < bi)) {
+                bv = v;
+                bi = i;
             }
         }
+        for (int off = 16; off; off >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+        sel_v[r] = bv;
+        sel_i[r] = bi;
+        if (lane == 0) score[bi] = -INFINITY;
+        __syncwarp();
     }
+    if (lane != 0) return;
     float ws = 0.f;
-    for (int j = 0; j < k; ++j) ws += raw[ti[j]];
+    for (int j = 0; j < k; ++j) ws += raw[sel_i[j]];
     for (int j = 0; j < k; ++j) {
-        const int e = ti[j];
+        const int e = sel_i[j];
         const float p = raw[e];
         ids[(size_t) row * Kp + j] = e;
         weights[(size_t) row * Kp + j] = weights_norm ? p / ws : p * route_scale;
@@ -330,16 +333,20 @@ __global__ void k_fetch(const int32_t* __restrict__ miss_e, const int32_t* __res
 
 /// y = x / sqrt(mean(x^2) + eps) * w, per row (grid = rows); w may be null.
 __global__ void k_rms_rows(const float* x, const float* w, float* y, int n, float eps) {
-    __shared__ float sh[kThreads];
+    __shared__ float sh[512];   // the decode launch uses 512 threads: this row's 32 KiB is one block either way, so the
+                                // block is the whole parallelism and 16 warps beat 4 (measured 15 us -> 5)
+    const int per = (n / 4) / (int) blockDim.x;
     const float* xg = x + (size_t) blockIdx.x * n;
     float* yg = y + (size_t) blockIdx.x * n;
     float s = 0.f;
-    if (n == 4096 && blockDim.x == 128) {
-        float v[32];
+    if (n % 4 == 0 && per >= 1 && per <= 8) {
+        float4 v[8];
 #pragma unroll
-        for (int k = 0; k < 32; ++k) v[k] = xg[threadIdx.x + 128 * k];
+        for (int k = 0; k < 8; ++k)
+            if (k < per) v[k] = reinterpret_cast<const float4*>(xg)[threadIdx.x + blockDim.x * k];
 #pragma unroll
-        for (int k = 0; k < 32; ++k) s += v[k] * v[k];
+        for (int k = 0; k < 8; ++k)
+            if (k < per) s += v[k].x * v[k].x + v[k].y * v[k].y + v[k].z * v[k].z + v[k].w * v[k].w;
     } else {
         for (int i = threadIdx.x; i < n; i += blockDim.x) s += xg[i] * xg[i];
     }
@@ -2403,7 +2410,7 @@ struct Engine {
             const Layer& L = m->layers[(size_t) l];
             cudaEvent_t* ea = pf ? &pev_a[(size_t) (16 * l)] : nullptr;
             if (pf) CK(cudaEventRecord(ea[8], st));
-            k_rms_rows<<<n, kThreads, 0, st>>>(x, L.attn_norm, h, N, m->eps);
+            k_rms_rows<<<n, n == 1 ? 512 : kThreads, 0, st>>>(x, L.attn_norm, h, N, m->eps);
             if (pf) CK(cudaEventRecord(ea[9], st));
             if (pf) CK(cudaEventRecord(ea[10], st));
             dump_t("norm", h, (size_t) n * N);
@@ -2572,7 +2579,7 @@ struct Engine {
             dbgstep("rms");
             cudaEvent_t* eg = pf ? &pev_g[(size_t) (6 * l)] : nullptr;
             if (pf) CK(cudaEventRecord(eg[0], st));
-            k_rms_rows<<<n, kThreads, 0, st>>>(x, L.post_norm, h, N, m->eps);
+            k_rms_rows<<<n, n == 1 ? 512 : kThreads, 0, st>>>(x, L.post_norm, h, N, m->eps);
             if (pf) CK(cudaEventRecord(eg[1], st));
             k_gemv_f32_rows<<<dim3(g.n_expert, n), kThreads, 0, st>>>(L.router, h, router, N, (int) g.n_expert, N);
             if (pf) CK(cudaEventRecord(eg[2], st));
@@ -2580,7 +2587,7 @@ struct Engine {
             // The selection runs on the device (k_route_topk) and writes wts_i / wts directly, so the per-layer
             // round-trip is one download of the id list - which the expert cache needs - and nothing else.  It used to
             // be a logits download plus a host top-k plus two uploads, four driver submissions per layer.
-            k_route_topk<<<n, 32, 0, st>>>(router, L.prob_bias, wts_i, wts, (int) g.n_expert, (int) Kp,
+            k_route_topk<<<n, 128, 0, st>>>(router, L.prob_bias, wts_i, wts, (int) g.n_expert, (int) Kp,
                                            m->route_scale, m->weights_norm ? 1 : 0);
             if (pf) CK(cudaEventRecord(eg[3], st));
             // STRATA_GLM4_ROUTECHECK: does the device selection agree with the host's (partial_sort with the same
@@ -2864,7 +2871,7 @@ struct Engine {
             dump_sum("moe");
             dbgstep("sum");
         }
-        k_rms_rows<<<n, kThreads, 0, st>>>(x, m->out_norm, h, N, m->eps);
+        k_rms_rows<<<n, n == 1 ? 512 : kThreads, 0, st>>>(x, m->out_norm, h, N, m->eps);
         if (n <= 8) {
             const size_t qb = quant(h, N, n, q8);
             for (int c = 0; c < n; ++c)
