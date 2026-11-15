@@ -1244,6 +1244,29 @@ So the expert matvec is ~12% of decode and ~17 s of a 67 s prefill: the tensor-c
 remaining time is.  The levers that are left are the attention kernel at long context (11 ms of the 43 at 10K, and it
 grows with every 1,000 tokens) and the ~25 ms/token that no matvec accounts for.
 
+### The decode attention kernels: 16-byte cache reads (bit-exact, `STRATA_GLM4_ATTN=fast` path unchanged)
+
+The long-context decode path is four kernels (`k_attn_scores` / `k_attn_softmax` / `k_attn_values` /
+`k_attn_combine`): one block per (KV head, 128-position tile) stages K's tile in shared memory, then each thread owns
+one position and computes the 8 heads that share that KV head.  The staging was one *value* per thread per position -
+a 32-byte request per warp, 128 dependent iterations - so 24 warps per SM had ~0.8 KiB of reads in flight against the
+~6 KiB Little's law wants at this card's latency.  It measured 58 GB/s of K.
+
+128 threads now move 16 bytes each per step (16 positions per iteration for int8, 8 for fp16), and
+`k_attn_values` keeps 16 positions in flight instead of 8.  Same arithmetic, same order: the token ids and the
+per-position attention sums of a 9,961-token decode are bit-identical to before.
+
+| decode, 120 tokens | before | after |
+|---|---|---|
+| 9,961-token context | 43.0 ms/token (24.8 tok/s) | **35.2 ms/token (28.4 tok/s)** |
+| 19,831-token context | 53.5 ms/token (18.7 tok/s) | **44.8 ms/token (22.3 tok/s)** |
+| 1,141-token context | 33.2 ms/token | 33.2 ms/token (attention there is ~1 ms) |
+
+That takes attention at 10K from ~11 ms/token to ~3.5, i.e. it is no longer the largest context-dependent term.
+What is left of the per-layer KV traffic is the score matrix itself (3.9 MB written, then read twice by the softmax
+and once by the values kernel at a 96-head x 10K context); folding the max into the scores' block reduction and the
+normalisation into the values accumulate would remove about a third of that, at the cost of bit-exactness.
+
 ## Architectures and backends
 
 `cmake/backends/cuda.cmake` defaults a hand build to `120` and warns about it: that is the RTX 50 card this engine

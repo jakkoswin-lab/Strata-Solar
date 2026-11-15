@@ -477,10 +477,32 @@ __global__ void k_attn_scores(const float* qk, const KT* kc, const __half* ksc, 
     const int d = threadIdx.x, R = H / HKV;
     const KT* kb = kc + (size_t) kvh * ctx * D;
     const __half* ks = ksc ? ksc + (size_t) kvh * ctx : nullptr;
-    for (int i = 0; i < 128; ++i) {
-        const bool ok = p0 + i < n_pos;
-        const float s = (ok && ks) ? __half2float(ks[p0 + i]) : 1.f;
-        tile[i][d] = ok ? __float2half(kv_load(&kb[(size_t) (p0 + i) * D + d], s)) : __float2half(0.f);
+    // Staging: 16 bytes per thread per step.  The old loop was one value per thread per position - a 32-byte request
+    // per warp, 128 dependent iterations - and measured 58 GB/s of K against the ~350 GB/s this card does: the pass
+    // was latency-bound (24 warps per SM with one 32-byte load each in flight is ~0.8 KiB, against ~6 KiB needed).
+    // 128 threads now cover 16 positions (int8) or 8 (half) per iteration with one uint4 load each.
+    {
+        constexpr int kVec = 16;                       // bytes per load
+        const int vpp = kVec / (int) sizeof(KT);       // values per load: 16 int8 or 8 halves
+        const int chunks = D / vpp;                    // loads per position: 8 or 16
+        const int pps = 128 / chunks;                  // positions per step: 16 or 8
+        const int c = (threadIdx.x % chunks) * vpp;
+        for (int i = threadIdx.x / chunks; i < 128; i += pps) {
+            const bool ok = p0 + i < n_pos;
+            uint4 raw = make_uint4(0, 0, 0, 0);
+            if (ok) memcpy(&raw, &kb[(size_t) (p0 + i) * D + c], kVec);
+            __half* o = tile[i] + c;
+            if constexpr (sizeof(KT) == 1) {
+                const float s = (ok && ks) ? __half2float(ks[p0 + i]) : 1.f;
+                const int8_t* b = reinterpret_cast<const int8_t*>(&raw);
+#pragma unroll
+                for (int j = 0; j < 16; ++j) o[j] = __float2half((float) b[j] * s);
+            } else {
+                const __half* hv = reinterpret_cast<const __half*>(&raw);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) o[j] = ok ? hv[j] : __float2half(0.f);
+            }
+        }
     }
     for (int i = d; i < R * D; i += blockDim.x) qs[i / D][i % D] = qk[(size_t) kvh * R * D + i];
     __syncthreads();
@@ -559,6 +581,18 @@ __global__ void k_attn_values(const float* sc, const KT* vc, const __half* vsc, 
         }
         __syncthreads();
         int p = 0;
+        for (; p + 15 < npc; p += 16) {
+            float v[16];
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int pj = p0 + base + p + j;
+                v[j] = kv_load(&vb[(size_t) pj * D + d], vs ? __half2float(vs[pj]) : 1.f);
+            }
+            for (int h = 0; h < R; ++h) {
+#pragma unroll
+                for (int j = 0; j < 16; ++j) acc[h] = fmaf(ps[h][p + j], v[j], acc[h]);
+            }
+        }
         for (; p + 7 < npc; p += 8) {
             float v[8];
 #pragma unroll
