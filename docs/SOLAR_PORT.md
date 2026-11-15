@@ -1398,6 +1398,24 @@ So the four-way split is the right shape on this card: the score matrix's 2.6 MB
 serialisation a single block needs to avoid it.  Both fused kernels stay in the tree behind
 `STRATA_GLM4_ATTN_FUSED` and both stay off.
 
+### The expert cache's VRAM budget, and the 1 GiB the engine keeps for the driver
+
+The cache takes `free VRAM - 1 GiB`, floored so that at least 640 MiB stays free, capped at 12 GiB.  With the card
+driving no display the only things that need room after the cache are the graph, the cuBLAS workspace and the logits,
+so the floor is the useful setting: `STRATA_GLM4_EXPERT_CACHE_MIB=<MiB>` (any value above the clamp works; the
+machine's launcher sets 12000).
+
+| 9,961 positions | slots | decode |
+|---|---|---|
+| 32K context, 1 GiB margin (the default) | 1,307 | 24.0 ms (41.7 tok/s) |
+| 32K, the 640 MiB floor | 1,391 | 23.8 ms (42.0) |
+| 16K, 1 GiB margin | 1,579 | 23.2 ms (43.1) |
+| 16K, the 640 MiB floor | 1,646 | **23.0 ms (43.5)** |
+
+The other half of the same budget is the KV cache - 3.3 GiB at a 32K context against 1.6 at 16K - so the context is
+worth more than the margin (+21% slots at 16K against +6%), and both are sub-linear in misses because the fill is
+mostly overlapped.  Under 640 MiB would be a code change for ~0.1 ms.
+
 ### Directions that were measured and rejected (so they are not tried again)
 
 Everything below was built and timed on this card, not estimated.  The numbers are the decode at 9,961 positions
