@@ -1230,19 +1230,28 @@ What the numbers mean:
 - At decode's one row, `iq_mmvq` already streams at 252 GB/s (0.024 ms per expert).  A warp-per-row vectorized dot
   written to beat it is *slower* (132 GB/s) and bit-identical, so load width is not what limits a single row.
 
-### Where a 10K decode actually goes
+### Where a 10K decode goes (graph on, profiler off)
 
-| | ms/token | note |
+| decode, 120 tokens | ms/token | tok/s |
 |---|---|---|
-| decode at 1,141-token context | 33.2 | fixed cost per token |
-| decode at 9,961-token context | 43.0 | +1.11 ms per 1,000 tokens of context (attention + KV reads) |
-| ... with `NOFETCH` (no expert copies) | 38.3 | the PCIe fill costs 4.7 ms of wall time: it is already overlapped |
-| ... with `STRATA_GLM4_NOGRAPH=1` | 44.8 | the captured graph is worth 1.8 ms |
-| routed experts (measured, both projections) | ~5 - 7 | `iq_mmvq_ptrs` at 8 experts/layer, 376+300 GB/s |
+| 1,141-token context | 20.9 | 47.8 |
+| 9,961-token context | 28.1 | 35.6 |
+| 19,831-token context | 38.5 | 26.0 |
+| routed experts (bench, both projections) | 5 - 7 | `iq_mmvq_ptrs`, 8 experts a layer |
+| attention, marginal | 0.9 per 1,000 tokens | ~8 ms at 10K, ~18 ms at 19.6K |
 
-So the expert matvec is ~12% of decode and ~17 s of a 67 s prefill: the tensor-core expert kernel is not where the
-remaining time is.  The levers that are left are the attention kernel at long context (11 ms of the 43 at 10K, and it
-grows with every 1,000 tokens) and the ~25 ms/token that no matvec accounts for.
+Two caveats that apply to every other decode number in this file:
+
+- **`STRATA_GLM4_PROF=1` costs a third of the speed.**  It syncs the host once per layer and turns the captured CUDA
+  graph off; together they cost 7-11 ms/token (43.0 with the profiler against 32.2 without on the same binary at
+  9,961 positions; 35.2 against 28.1 on the next one).  Read the profiler's per-stage buckets as ratios, never as
+  absolute times.
+- `NOFETCH` (no expert copies at all) was 38.3 against 43.0 under the profiler, so the PCIe fill costs ~4.7 ms of
+  wall time and is already overlapped by the rest of the step.
+
+So at 10K: attention ~8 ms, experts ~5-6 ms, dense projections + shared expert + head ~13 ms, ~2 ms everything else.
+The expert matvec is the same order as the dense weights, which is why the tensor-core expert work above was a dead
+end for decode.
 
 ### The decode attention kernels: 16-byte cache reads (bit-exact, `STRATA_GLM4_ATTN=fast` path unchanged)
 
@@ -1258,11 +1267,12 @@ per-position attention sums of a 9,961-token decode are bit-identical to before.
 
 | decode, 120 tokens | before | after |
 |---|---|---|
-| 9,961-token context | 43.0 ms/token (24.8 tok/s) | **35.2 ms/token (28.4 tok/s)** |
-| 19,831-token context | 53.5 ms/token (18.7 tok/s) | **44.8 ms/token (22.3 tok/s)** |
-| 1,141-token context | 33.2 ms/token | 33.2 ms/token (attention there is ~1 ms) |
+| 1,141-token context | 22.1 ms/token (45.3 tok/s) | **20.9 ms/token (47.8 tok/s)** |
+| 9,961-token context | 32.2 ms/token (31.1 tok/s) | **28.1 ms/token (35.6 tok/s)** |
+| 19,831-token context | 47.9 ms/token (20.9 tok/s) | **38.5 ms/token (26.0 tok/s)** |
 
-That takes attention at 10K from ~11 ms/token to ~3.5, i.e. it is no longer the largest context-dependent term.
+(Two binaries built from the commit before and after, the captured graph on, no profiler.)  The context-dependent
+term drops from 1.38 to 0.94 ms per 1,000 tokens: attention at 10K goes from ~12 to ~8 ms.
 What is left of the per-layer KV traffic is the score matrix itself (3.9 MB written, then read twice by the softmax
 and once by the values kernel at a 96-head x 10K context); folding the max into the scores' block reduction and the
 normalisation into the values accumulate would remove about a third of that, at the cost of bit-exactness.
