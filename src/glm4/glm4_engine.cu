@@ -591,6 +591,8 @@ __global__ void k_attn_scores_tc(const float* qk, const KT* kc, const __half* ks
     const int warp = tid >> 5, lane = tid & 31;
     const int pn = warp * 16;
     if (pn >= 128) return;
+    // an sm_60 pass of a multi-arch build has no nvcuda::wmma; these kernels are CUDA 7.x only
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc;
     nvcuda::wmma::fill_fragment(acc, 0.f);
     for (int k0 = 0; k0 < D; k0 += 16) {
@@ -601,6 +603,7 @@ __global__ void k_attn_scores_tc(const float* qk, const KT* kc, const __half* ks
         nvcuda::wmma::mma_sync(acc, fa, fb, acc);
     }
     nvcuda::wmma::store_matrix_sync(so[warp], acc, 16, nvcuda::wmma::mem_row_major);
+#endif
     __syncwarp();
     for (int i = lane; i < 16 * R; i += 32) {
         const int h = i / 16, pp = i - h * 16;
@@ -765,6 +768,8 @@ __global__ void k_attn_flash_dec(const float* qk, const KT* kc, const KT* vc, co
             }
         }
         __syncthreads();
+        // an sm_60 pass of a multi-arch build has no nvcuda::wmma; these kernels are CUDA 7.x only
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         for (int g = warp; g < 8; g += nwarp) {
             nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> a;
             nvcuda::wmma::fill_fragment(a, 0.f);
@@ -777,6 +782,7 @@ __global__ void k_attn_flash_dec(const float* qk, const KT* kc, const KT* vc, co
             }
             nvcuda::wmma::store_matrix_sync(so[g], a, 16, nvcuda::wmma::mem_row_major);
         }
+#endif
         __syncthreads();
         // this thread owns position tid of the tile: fetch the 8 heads' scores, out-of-range positions are dropped
         const int sg = tid >> 4, spp = tid & 15;
@@ -928,6 +934,8 @@ __global__ void k_attn_flash_dec2(const float* qk, const KT* kc, const KT* vc, c
             }
         }
         __syncthreads();
+        // an sm_60 pass of a multi-arch build has no nvcuda::wmma; these kernels are CUDA 7.x only
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         for (int g = warp; g < PT / 16; g += nwarp) {
             nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> a;
             nvcuda::wmma::fill_fragment(a, 0.f);
@@ -940,6 +948,7 @@ __global__ void k_attn_flash_dec2(const float* qk, const KT* kc, const KT* vc, c
             }
             nvcuda::wmma::store_matrix_sync(so[g], a, 16, nvcuda::wmma::mem_row_major);
         }
+#endif
         __syncthreads();
         const int sg = tid >> 4, spp = tid & 15;
         const bool owns = tid < PT;
@@ -1649,6 +1658,7 @@ struct Engine {
     // shared memory leaves 4 blocks an SM, and its 128 threads have to do the scores and the V accumulation in turn,
     // where the four kernels get 256 threads for the scores and 8 KiB a block for the values.  Off by default.
     int att_fused = 0;   // STRATA_GLM4_ATTN_FUSED=1|2: the fused pass instead of the four kernels
+    bool att_wmma = true;   // the device is Volta or later: the tensor-core score kernels have a body there
     int att_splits = 32;   // STRATA_GLM4_ATTN_SPLITS: position splits for the value accumulation
     bool att_gemm = false;   // force the GEMM path
     int att_thresh = 640;    // ... or use it once the context passes this many positions (STRATA_GLM4_ATTN=fast disables)
@@ -2037,6 +2047,12 @@ struct Engine {
         // need it: decode uses the GEMM path past att_thresh (global memory) and the prompt pass uses flash
         // attention, neither of which keeps a score row.  Without this a 32K context failed at start with
         // "cudaFuncSetAttribute ... invalid argument" even though no kernel would have asked for that memory.
+        {
+            int dev = 0, major = 0;
+            att_wmma = cudaGetDevice(&dev) == cudaSuccess &&
+                       cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                       major >= 7;
+        }
         int max_smem = ctx * (int) sizeof(float);
         if (max_smem > 48 * 1024) {
             const cudaError_t e = cudaFuncSetAttribute((const void*) k_attn_rows,
@@ -2450,7 +2466,7 @@ struct Engine {
                 if (l == 0 && std::getenv("STRATA_GLM4_ATTN_DBG"))
                     std::fprintf(stderr, "fused dbg: n=%lld pos_stage=%lld n_tiles=%d fsplit=%d nsplits=%d\n",
                                  (long long) n, (long long) pos_stage, n_tiles_now, fsplit, nsplits);
-                if (att_fused >= 2) {
+                if (att_fused >= 2 && att_wmma) {
                     // 64-position tiles and 256 threads: seven blocks an SM, two threads per dim
                     if (kv_i8)
                         k_attn_flash_dec2<int8_t><<<dim3(HKV, fsplit), 256, 0, st>>>(
@@ -2463,7 +2479,7 @@ struct Engine {
                     if (pf) CK(cudaEventRecord(ea[1], st));
                     k_attn_combine_f<<<H, D, 0, st>>>(att_part, att_pmax, att_psum, att, H, D, fsplit, D);
                     if (pf) CK(cudaEventRecord(ea[4], st));
-                } else if (att_fused == 1) {
+                } else if (att_fused == 1 && att_wmma) {
                     // one pass: K and V read once each, no score matrix (flash-decoding)
                     if (kv_i8)
                         k_attn_flash_dec<int8_t><<<dim3(HKV, fsplit), 128, 0, st>>>(
@@ -2478,7 +2494,7 @@ struct Engine {
                     k_attn_combine_f<<<H, D, 0, st>>>(att_part, att_pmax, att_psum, att, H, D, fsplit, D);
                     if (pf) CK(cudaEventRecord(ea[4], st));
                 } else {
-                if (att_tc && H / HKV <= 16 && D == 128) {
+                if (att_tc && att_wmma && H / HKV <= 16 && D == 128) {
                     if (kv_i8)
                         k_attn_scores_tc<int8_t><<<dim3(HKV, tiles), 256, 0, st>>>(
                             qkf, (const int8_t*) kc[(size_t) l], ksc[(size_t) l], att_sc, H, HKV, D, ctx, d_pos,
