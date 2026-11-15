@@ -1234,7 +1234,7 @@ What the numbers mean:
 
 | decode, 120 tokens | ms/token | tok/s |
 |---|---|---|
-| 1,141-token context | 20.0 | 50.0 |
+| 1,141-token context | 19.2 | 52.0 |
 | 9,961-token context | 24.0 | 41.6 |
 | 19,831-token context | 33.2 | 30.1 |
 | routed experts (bench, both projections) | 5 - 7 | `iq_mmvq_ptrs`, 8 experts a layer |
