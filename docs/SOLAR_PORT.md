@@ -1234,8 +1234,8 @@ What the numbers mean:
 
 | decode, 120 tokens | ms/token | tok/s |
 |---|---|---|
-| 1,141-token context | 20.4 | 49.0 |
-| 9,961-token context | 24.9 | 40.1 |
+| 1,141-token context | 20.0 | 50.0 |
+| 9,961-token context | 24.0 | 41.6 |
 | 19,831-token context | 33.2 | 30.1 |
 | routed experts (bench, both projections) | 5 - 7 | `iq_mmvq_ptrs`, 8 experts a layer |
 | attention, marginal | 0.5 per 1,000 tokens | ~5 ms at 10K, ~10 ms at 19.6K |
@@ -1257,14 +1257,18 @@ add up to what the engine reports.  The attention phase carries eight sub-probes
 
 | bucket | ms/token | share | of which |
 |---|---|---|---|
-| attn | 14.62 | 41% | scores 2.76, values 2.77, softmax 0.98, combine 0.20, **rms (pre) 2.39**, q/k/v 2.46, qk_prep 0.34, o proj 2.13 |
-| gate/up | 12.53 | 36% | k_fetch (see the caveat), k_resolve 0.73, the matvec ~5.5 |
-| down | 3.04 | 9% | |
-| shared (expert) | 2.00 | 6% | |
-| router | 1.77 | 5% | rms 0.73, gemv 0.42, top-k 0.53 |
-| head | 1.36 | 4% | |
-| embed | 0.08 | 0% | |
-| **total** | **35.44** | | against 26.3 with the graph: ~9 ms of launch gaps are what the graph covers |
+| attn | 14.44 | 42% | scores 2.69, values 2.80, softmax 0.98, combine 0.20, rms (pre) 1.86*, q/k/v 2.56, qk_prep 0.36, o proj 2.13 |
+| gate/up | 12.22 | 36% | k_fetch (see the caveat), k_resolve 0.64, the matvec ~6.7 |
+| down | 3.05 | 9% | |
+| shared (expert) | 2.04 | 6% | |
+| router | 1.16 | 3% | rms 0.38, gemv 0.40, top-k 0.31 |
+| head | 1.34 | 4% | |
+| embed | 0.06 | 0% | |
+| **total** | **34.31** | | against 24.0 with the graph: ~10 ms of launch gaps are what the graph covers |
+
+*the pre-attention norm reads the row that the previous layer's expert matvecs have just pushed out of L2, and its
+event pair also inherits the gap the host leaves in front of it; the same kernel measured as the router's norm (rows
+that are L2-hot) is 7.9 us a layer with 512 threads, against 15.2 with the 128 the chunk path uses.
 
 The `k_fetch` span is not the copy's duration - it brackets the launch of a kernel on the same stream, and the
 misses it reports (132.6 blobs, 799 MB a token) would be 27 GB/s if spread over the whole step, i.e. at the link's
@@ -1335,6 +1339,31 @@ the first attempt died on `misaligned address`.
 
 Measured against the build from before both attention changes of this session, at 1,141 / 9,961 / 19,831 positions:
 22.1 -> 21.5, 32.2 -> 26.3, 47.9 -> 33.2 ms/token (-3%, -18%, -31%).
+
+### The two per-layer kernels that were shaped for a prompt chunk
+
+Both are wrong for a single row and both were fixed without changing the output (the 24 greedy token ids of the 10K
+decode are identical before and after): `k_rms_rows` ran one 128-thread block per row, so decode's 4096-value norm sat
+on a single SM (15 us a layer for 32 KiB) - a row is one block either way, so the block *is* the parallelism, and 512
+threads with 16-byte loads take it to 7.9 us - and `k_route_topk` picked the eight experts in one thread's insertion
+sort (128 dependent steps, 11 us a layer) where eight warp-argmax rounds give the same eight experts in the same
+(score desc, index asc) order for 6.4 us.
+
+25.1 -> 24.0 ms/token (39.9 -> 41.6 tok/s).
+
+### Where the "aggregate bandwidth" gap actually is
+
+5.5 GB of weights and KV a token over 24.0 ms is ~230 GB/s, against the ~370 a kernel reaches on its own.  The gap is
+not one kernel:
+
+- `gate/up` (12.22 ms of the un-graphed 34.31) carries the PCIe fill of the expert cache; the `NOFETCH` ablation says
+  that costs ~4.7 ms of wall time even on the same stream as the matvecs
+- the two streaming attention kernels run at ~240 GB/s each (scores 2.69, values 2.80 for 10.5 MB apiece)
+- six small kernels a layer (router gemv, qk_prep, softmax, combine, the add, the q8_1 quantisations) are 0.1-0.4 ms
+  each, ~1.5 ms together
+
+Each needs a different fix - more expert slots (or a smaller context) for the fill, and attention is already the best
+of the shapes tried - which is why this session stopped there.
 
 ### The four attention kernels fused: correct, and slower (`STRATA_GLM4_ATTN_FUSED=1`)
 
