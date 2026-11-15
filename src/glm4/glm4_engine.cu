@@ -24,6 +24,7 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
 #include <algorithm>
 #include <atomic>
@@ -529,6 +530,76 @@ __global__ void k_attn_scores(const float* qk, const KT* kc, const __half* ksc, 
         for (int h = 0; h < R; ++h) acc[h] = fmaf(qs[h][e], k0, acc[h]);
     }
     for (int h = 0; h < R; ++h) sc[(size_t) (kvh * R + h) * ctx + p0 + i] = acc[h] * scale;
+}
+
+/// Tensor-core QK: the same K tile, one 16x16x16 fp16 fragment product per (16 heads, 16 positions, 16 dims) step.
+/// The fma kernel above does 1024 fmaf per thread for the same tile and measured 122 us a layer at 10K (it is
+/// instruction-bound: ~2.5 GB/s of effective K traffic), so this replaces the arithmetic, not the memory movement.
+/// One block is the same (KV head, 128-position tile) with 256 threads: warp w owns positions [w*16, w*16+16), M is
+/// the R <= 16 heads padded with zero rows, and K walks the dims in 16s.  q is rounded to fp16 for the product; the
+/// cache it is compared against is already int8 with a per-position scale, and the accumulators stay fp32.
+/// STRATA_GLM4_ATTN_TC=0 keeps the fma kernel.
+template <class KT>
+__global__ void k_attn_scores_tc(const float* qk, const KT* kc, const __half* ksc, float* sc, int H, int HKV, int D,
+                                 int ctx, const int64_t* pos0p, float scale) {
+    const int n_pos = (int) (*pos0p) + 1;
+    __shared__ __align__(32) __half qsh[16][128];      // q rounded to fp16, padded to 16 rows (only R are real)
+    __shared__ __align__(32) __half tile[128][136];    // the K tile: 136 halves = 272 bytes, so every 16-column
+                                                       // fragment pointer is 16-byte aligned (ldmatrix's contract)
+    __shared__ __align__(32) float so[8][256];         // one 16x16 fp32 accumulator tile per warp
+    const int kvh = blockIdx.x, t = blockIdx.y;
+    const int p0 = t * 128;
+    if (p0 >= n_pos) return;
+    const int tid = threadIdx.x, R = H / HKV;
+    const KT* kb = kc + (size_t) kvh * ctx * D;
+    const __half* ks = ksc ? ksc + (size_t) kvh * ctx : nullptr;
+    {
+        constexpr int kVec = 16;
+        const int vpp = kVec / (int) sizeof(KT);
+        const int chunks = D / vpp;
+        const int pps = (int) blockDim.x / chunks;
+        const int c = (tid % chunks) * vpp;
+        for (int i = tid / chunks; i < 128; i += pps) {
+            const bool ok = p0 + i < n_pos;
+            uint4 raw = make_uint4(0, 0, 0, 0);
+            if (ok) memcpy(&raw, &kb[(size_t) (p0 + i) * D + c], kVec);
+            __half* o = tile[i] + c;
+            if constexpr (sizeof(KT) == 1) {
+                const float s = (ok && ks) ? __half2float(ks[p0 + i]) : 1.f;
+                const int8_t* b = reinterpret_cast<const int8_t*>(&raw);
+#pragma unroll
+                for (int j = 0; j < 16; ++j) o[j] = __float2half((float) b[j] * s);
+            } else {
+                const __half* hv = reinterpret_cast<const __half*>(&raw);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) o[j] = ok ? hv[j] : __float2half(0.f);
+            }
+        }
+    }
+    for (int i = tid; i < 16 * D; i += (int) blockDim.x) {
+        const int r = i / D, e = i - r * D;
+        qsh[r][e] = r < R ? __float2half(qk[(size_t) kvh * R * D + (size_t) r * D + e]) : __float2half(0.f);
+    }
+    __syncthreads();
+    const int warp = tid >> 5, lane = tid & 31;
+    const int pn = warp * 16;
+    if (pn >= 128) return;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc;
+    nvcuda::wmma::fill_fragment(acc, 0.f);
+    for (int k0 = 0; k0 < D; k0 += 16) {
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major> fa;
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::col_major> fb;
+        nvcuda::wmma::load_matrix_sync(fa, &qsh[0][k0], 128);
+        nvcuda::wmma::load_matrix_sync(fb, &tile[pn][k0], 136);
+        nvcuda::wmma::mma_sync(acc, fa, fb, acc);
+    }
+    nvcuda::wmma::store_matrix_sync(so[warp], acc, 16, nvcuda::wmma::mem_row_major);
+    __syncwarp();
+    for (int i = lane; i < 16 * R; i += 32) {
+        const int h = i / 16, pp = i - h * 16;
+        const int p = p0 + pn + pp;
+        if (p < n_pos) sc[(size_t) (kvh * R + h) * ctx + p] = so[warp][h * 16 + pp] * scale;
+    }
 }
 
 __global__ void k_attn_softmax(float* sc, int H, int ctx, const int64_t* pos0p) {
@@ -1256,6 +1327,7 @@ struct Engine {
     int32_t tok_stage = 0;
     int attn_skip = 0;     // STRATA_GLM4_ATTN_SKIP=1: stop the prefill attention after the scores (timing)
     bool att_flash = true;    // STRATA_GLM4_NO_ATTN_FLASH=1 falls back to the per-head prompt kernel
+    bool att_tc = true;       // STRATA_GLM4_ATTN_TC=0: fp32 fma instead of fp16 tensor cores in the decode scores
     int att_tiles = 1;     // fixed at the maximum over the context, so the grids never change
     int att_nsplits = 1;
     bool dev_cache = false;
@@ -1437,6 +1509,7 @@ struct Engine {
         graph_enabled = std::getenv("STRATA_GLM4_NOGRAPH") == nullptr;
         if (const char* v = std::getenv("STRATA_GLM4_ATTN_SKIP")) attn_skip = std::atoi(v);
         att_flash = std::getenv("STRATA_GLM4_NO_ATTN_FLASH") == nullptr;
+        att_tc = std::getenv("STRATA_GLM4_ATTN_TC") == nullptr || std::atoi(std::getenv("STRATA_GLM4_ATTN_TC")) != 0;
         // STRATA_GLM4_KV_INT8: the cache holds one int8 per value plus a per-(head, position) scale, so it takes
         // half the VRAM and the expert cache grows.  Only the GEMM decode and flash prompt kernels carry it, so the
         // decode threshold is dropped to 0 and the flash path is forced (the older kernels stay half-only).
@@ -1991,7 +2064,15 @@ struct Engine {
                 const float scale = 1.0f / sqrtf((float) D);
                 cudaEvent_t* ea = pf ? &pev_a[(size_t) (8 * l)] : nullptr;
                 if (pf) CK(cudaEventRecord(ea[0], st));
-                if (kv_i8)
+                if (att_tc && H / HKV <= 16 && D == 128) {
+                    if (kv_i8)
+                        k_attn_scores_tc<int8_t><<<dim3(HKV, tiles), 256, 0, st>>>(
+                            qkf, (const int8_t*) kc[(size_t) l], ksc[(size_t) l], att_sc, H, HKV, D, ctx, d_pos,
+                            scale);
+                    else
+                        k_attn_scores_tc<__half><<<dim3(HKV, tiles), 256, 0, st>>>(
+                            qkf, (const __half*) kc[(size_t) l], nullptr, att_sc, H, HKV, D, ctx, d_pos, scale);
+                } else if (kv_i8)
                     k_attn_scores<int8_t><<<dim3(HKV, tiles), 128, 0, st>>>(
                         qkf, (const int8_t*) kc[(size_t) l], ksc[(size_t) l], att_sc, H, HKV, D, ctx, d_pos, scale);
                 else

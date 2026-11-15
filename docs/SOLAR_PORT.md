@@ -1234,11 +1234,11 @@ What the numbers mean:
 
 | decode, 120 tokens | ms/token | tok/s |
 |---|---|---|
-| 1,141-token context | 20.9 | 47.8 |
-| 9,961-token context | 28.1 | 35.6 |
-| 19,831-token context | 38.5 | 26.0 |
+| 1,141-token context | 21.5 | 46.5 |
+| 9,961-token context | 26.3 | 38.1 |
+| 19,831-token context | 33.2 | 30.1 |
 | routed experts (bench, both projections) | 5 - 7 | `iq_mmvq_ptrs`, 8 experts a layer |
-| attention, marginal | 0.9 per 1,000 tokens | ~8 ms at 10K, ~18 ms at 19.6K |
+| attention, marginal | 0.6 per 1,000 tokens | ~6 ms at 10K, ~12 ms at 19.6K |
 
 Two caveats that apply to every other decode number in this file:
 
@@ -1257,14 +1257,14 @@ add up to what the engine reports:
 
 | bucket | ms/token | share | of which |
 |---|---|---|---|
-| attn | 17.16 | 44% | scores 5.87, values 2.71, softmax 0.98, combine 0.22, **q/k/v/o projections ~7.4** |
-| gate/up | 13.59 | 35% | k_fetch 7.20 (see the caveat), k_resolve 0.73, the matvec ~5.7 |
+| attn | 14.01 | 39% | scores 2.68, values 2.73, softmax 0.98, combine 0.22, **q/k/v/o projections ~7.4** |
+| gate/up | 13.58 | 37% | k_fetch 7.20 (see the caveat), k_resolve 0.73, the matvec ~5.7 |
 | down | 3.05 | 8% | |
-| shared (expert) | 2.02 | 5% | |
+| shared (expert) | 2.02 | 6% | |
 | router | 1.82 | 5% | rms 0.70, gemv 0.47, top-k 0.54 |
-| head | 1.36 | 3% | |
+| head | 1.36 | 4% | |
 | embed | 0.08 | 0% | |
-| **total** | **39.09** | | against 28.1 with the graph: ~11 ms of launch gaps are what the graph covers |
+| **total** | **36.25** | | against 26.3 with the graph: ~10 ms of launch gaps are what the graph covers |
 
 The `k_fetch` span is not the copy's duration - it brackets the launch of a kernel on the same stream, and the
 misses it reports (132.6 blobs, 799 MB a token) would be 27 GB/s if spread over the whole step, i.e. at the link's
@@ -1272,17 +1272,17 @@ limit.  The reliable number is the `NOFETCH` ablation: the fill costs ~4.7 ms of
 hides it.
 
 So the "25 ms that no matvec accounts for" does not exist: ~11 ms of it was launch gaps (hidden by the graph) and
-the rest was the division bug.  What is really left at 10K, in the graphed 28.1 ms:
+the rest was the division bug.  What is really left at 10K, in the graphed 26.3 ms:
 
-- attention kernels **9.8 ms** - scores alone is 5.87 (122 us a layer for 10.5 MB of K and 3.9 MB of scores, i.e.
-  ~2.5 GB/s: the QK dots are now instruction-bound, two shared-memory operands per fma, not bandwidth-bound)
+- attention kernels **6.6 ms** - scores 2.68 (tensor cores), values 2.73, softmax 0.98, combine 0.22
 - dense projections, shared expert and head **10.8 ms**
 - routed expert matvecs **8.7 ms** (376 + 300 GB/s in the bench: near the card's floor)
 - router, norms, sampling **1.9 ms**
 
-The next lever is the scores kernel's arithmetic (half2 or int8 dot products instead of one fp32 fma per two
-shared reads), worth up to 4 ms/token; after that the dense projections at one column, which the bench measures at
-123-175 GB/s against 300+ for the same weights with eight columns.
+The largest single item is now the **q/k/v/o dense projections (~7.4 ms)**: one-column matvecs that the bench
+measures at 123-175 GB/s against 300+ for the same weights with eight columns, so a GEMV kernel with more
+independent work per weight byte is the next lever.  After that, `k_attn_values` (2.73 ms at 185 GB/s of V) and the
+scores' int8 staging.
 
 ### The decode attention kernels: 16-byte cache reads (bit-exact, `STRATA_GLM4_ATTN=fast` path unchanged)
 
@@ -1307,6 +1307,31 @@ term drops from 1.38 to 0.94 ms per 1,000 tokens: attention at 10K goes from ~12
 What is left of the per-layer KV traffic is the score matrix itself (3.9 MB written, then read twice by the softmax
 and once by the values kernel at a 96-head x 10K context); folding the max into the scores' block reduction and the
 normalisation into the values accumulate would remove about a third of that, at the cost of bit-exactness.
+
+### The decode QK scores on the tensor cores (`STRATA_GLM4_ATTN_TC=0` keeps the fma kernel)
+
+The 16-byte staging took the scores kernel to ~154 GB/s of K and the bucket then read 5.87 ms/token: 122 us a layer
+for 10.5 MB of K, so the arithmetic was the wall, not the memory.  Per thread that kernel ran 1024 `fmaf` (8 heads x
+128 dims) over a shared tile the staging had built one value at a time - about 65 instructions per 16 bytes.
+
+One block is still (KV head, 128-position tile), now with 256 threads: warp w owns positions [w*16, w*16+16), the
+R = 8 heads pad to the M = 16 of a 16x16x16 fp16 fragment, and the dims walk in 16s, so a warp issues 8 `mma.sync`
+instead of 1024 `fmaf` per thread.  q is rounded to fp16 for the product - the cache it is compared against is int8
+with a per-position scale already - and the accumulators stay fp32.  The tile stride is 136 halves (272 bytes)
+rather than 130 so every fragment pointer is 16-byte aligned, which is `ldmatrix`'s contract: 130 halves is not, and
+the first attempt died on `misaligned address`.
+
+| | before | after |
+|---|---|---|
+| attn scores | 5.87 ms/token (122 us/layer) | **2.68 ms/token (56 us/layer)** |
+| decode, 9,961 positions | 28.1 ms/token (35.6 tok/s) | **26.3 ms/token (38.1 tok/s)** |
+| decode, 19,831 positions | 38.5 ms/token (26.0 tok/s) | **33.2 ms/token (30.1 tok/s)** |
+| attention output, layer 0, last position | - | max delta 7.3e-05 (1e-4 relative) |
+| 6 greedy token ids at 10K | - | identical |
+| chapter 24, 112-token translation | - | unchanged text |
+
+Measured against the build from before both attention changes of this session, at 1,141 / 9,961 / 19,831 positions:
+22.1 -> 21.5, 32.2 -> 26.3, 47.9 -> 33.2 ms/token (-3%, -18%, -31%).
 
 ## Architectures and backends
 
