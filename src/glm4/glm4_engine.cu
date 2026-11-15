@@ -693,6 +693,185 @@ __global__ void k_attn_combine(const float* part, float* out, int H, int D, int 
     out[(size_t) h * qstride + d] = acc;
 }
 
+/// Fused decode attention: one block per (KV head, tile split), 128 threads = the D dims.  For each 128-position
+/// tile it stages K, computes the 8 heads that share the KV head on the tensor cores into shared memory, folds them
+/// into an online softmax (running max and sum per head, the accumulator rescaled when the max grows) and
+/// accumulates exp(s) * V.  K and V are each read once and the score matrix never exists: the four-kernel path
+/// writes 2.6 MB of scores at 10K and reads it back three times (2.6 of H x ctx x 4), which is
+/// k_attn_scores_tc + k_attn_softmax + k_attn_values + k_attn_combine.  Partials are per split (max, sum, weighted V)
+/// and k_attn_combine_f merges them.  Numerically this is the standard flash form: a different summation order, the
+/// same terms.
+template <class KT>
+__global__ void k_attn_flash_dec(const float* qk, const KT* kc, const KT* vc, const __half* ksc, const __half* vsc,
+                                 float* part, float* pmax, float* psum, int H, int HKV, int D, int ctx,
+                                 const int64_t* pos0p, float scale, int nsplits, int n_tiles) {
+    const int n_pos = (int) (*pos0p) + 1;
+    __shared__ __align__(32) __half qsh[16][128];     // q, fp16, padded to 16 rows (only R are real)
+    __shared__ __align__(32) __half tile[128][136];   // the K tile, 136 halves so fragment pointers stay aligned
+    __shared__ __align__(32) float so[8][256];   // one 16x16 fp32 score tile per position group; exp(s) is
+                                                 // written back into it, so no separate probability array
+    __shared__ float red[4][8];
+    __shared__ float msh[8], ssh[8];
+    const int kvh = blockIdx.x, sp = blockIdx.y;
+    const int n_now = (n_pos + 127) / 128;   // the graph freezes the launch, so derive the split from the position
+    const int t0 = (int) ((long long) n_now * sp / nsplits);
+    const int t1 = (int) ((long long) n_now * (sp + 1) / nsplits);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, R = H / HKV;
+    const int nwarp = (int) blockDim.x >> 5;
+    const KT* kb = kc + (size_t) kvh * ctx * D;
+    const KT* vb = vc + (size_t) kvh * ctx * D;
+    const __half* ks = ksc ? ksc + (size_t) kvh * ctx : nullptr;
+    const __half* vs = vsc ? vsc + (size_t) kvh * ctx : nullptr;
+    float acc[8], mrun[8], srun[8];
+#pragma unroll
+    for (int h = 0; h < 8; ++h) {
+        acc[h] = 0.f;
+        mrun[h] = -INFINITY;
+        srun[h] = 0.f;
+    }
+    for (int i = tid; i < 16 * D; i += (int) blockDim.x) {
+        const int r = i / D, e = i - r * D;
+        qsh[r][e] = r < R ? __float2half(qk[(size_t) kvh * R * D + (size_t) r * D + e]) : __float2half(0.f);
+    }
+    for (int t = t0; t < t1; ++t) {
+        const int p0 = t * 128;
+        const int rows = min(128, n_pos - p0);
+        {
+            constexpr int kVec = 16;
+            const int vpp = kVec / (int) sizeof(KT), chunks = D / vpp, pps = (int) blockDim.x / chunks;
+            const int c = (tid % chunks) * vpp;
+            for (int i = tid / chunks; i < 128; i += pps) {
+                const bool ok = p0 + i < n_pos;
+                uint4 raw = make_uint4(0, 0, 0, 0);
+                if (ok) memcpy(&raw, &kb[(size_t) (p0 + i) * D + c], kVec);
+                __half* o = tile[i] + c;
+                if constexpr (sizeof(KT) == 1) {
+                    const float sc = (ok && ks) ? __half2float(ks[p0 + i]) : 1.f;
+                    const int8_t* b = reinterpret_cast<const int8_t*>(&raw);
+#pragma unroll
+                    for (int j = 0; j < 16; ++j) o[j] = __float2half((float) b[j] * sc);
+                } else {
+                    const __half* hv = reinterpret_cast<const __half*>(&raw);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) o[j] = ok ? hv[j] : __float2half(0.f);
+                }
+            }
+        }
+        __syncthreads();
+        for (int g = warp; g < 8; g += nwarp) {
+            nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> a;
+            nvcuda::wmma::fill_fragment(a, 0.f);
+            for (int k0 = 0; k0 < D; k0 += 16) {
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major> fa;
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::col_major> fb;
+                nvcuda::wmma::load_matrix_sync(fa, &qsh[0][k0], 128);
+                nvcuda::wmma::load_matrix_sync(fb, &tile[g * 16][k0], 136);
+                nvcuda::wmma::mma_sync(a, fa, fb, a);
+            }
+            nvcuda::wmma::store_matrix_sync(so[g], a, 16, nvcuda::wmma::mem_row_major);
+        }
+        __syncthreads();
+        // this thread owns position tid of the tile: fetch the 8 heads' scores, out-of-range positions are dropped
+        const int sg = tid >> 4, spp = tid & 15;
+        const bool has = tid < rows;
+#pragma unroll
+        for (int h = 0; h < 8; ++h) so[sg][h * 16 + spp] = has ? so[sg][h * 16 + spp] * scale : -INFINITY;
+        __syncthreads();
+        float tm[8];
+#pragma unroll
+        for (int h = 0; h < 8; ++h) {
+            float x = so[sg][h * 16 + spp];
+#pragma unroll
+            for (int o = 16; o; o >>= 1) x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, o));
+            tm[h] = x;
+        }
+        if (lane == 0)
+#pragma unroll
+            for (int h = 0; h < 8; ++h) red[warp][h] = tm[h];
+        __syncthreads();
+        if (tid < 8) {
+            float x = red[0][tid];
+            for (int w = 1; w < nwarp; ++w) x = fmaxf(x, red[w][tid]);
+            red[0][tid] = x;
+        }
+        __syncthreads();
+        float corr[8];
+#pragma unroll
+        for (int h = 0; h < 8; ++h) {
+            const float mn = fmaxf(mrun[h], red[0][h]);
+            corr[h] = __expf(mrun[h] - mn);   // -inf on the first tile: 0, and acc starts at 0 anyway
+            mrun[h] = mn;
+        }
+#pragma unroll
+        for (int h = 0; h < 8; ++h) {
+            acc[h] *= corr[h];
+            srun[h] *= corr[h];
+        }
+#pragma unroll
+        for (int h = 0; h < 8; ++h)
+            so[sg][h * 16 + spp] =
+                so[sg][h * 16 + spp] == -INFINITY ? 0.f : __expf(so[sg][h * 16 + spp] - mrun[h]);
+        __syncthreads();
+        float ts[8];
+#pragma unroll
+        for (int h = 0; h < 8; ++h) {
+            float x = so[sg][h * 16 + spp];
+#pragma unroll
+            for (int o = 16; o; o >>= 1) x += __shfl_xor_sync(0xffffffffu, x, o);
+            ts[h] = x;
+        }
+        if (lane == 0)
+#pragma unroll
+            for (int h = 0; h < 8; ++h) red[warp][h] = ts[h];
+        __syncthreads();
+        if (tid < 8) {
+            float x = red[0][tid];
+            for (int w = 1; w < nwarp; ++w) x += red[w][tid];
+            red[0][tid] = x;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int h = 0; h < 8; ++h) srun[h] += red[0][h];
+        // ---- exp(s) * V for this tile
+        for (int p = 0; p < rows; ++p) {
+            const float v = kv_load(&vb[(size_t) (p0 + p) * D + tid], vs ? __half2float(vs[p0 + p]) : 1.f);
+            const float* pr = so[p >> 4] + (p & 15);
+#pragma unroll
+            for (int h = 0; h < 8; ++h) acc[h] = fmaf(pr[h * 16], v, acc[h]);
+        }
+        __syncthreads();   // ps is rewritten by the next tile
+    }
+    for (int h = 0; h < R; ++h)
+        part[((size_t) (kvh * R + h) * nsplits + sp) * D + tid] = acc[h];
+    if (tid == 0) {
+#pragma unroll
+        for (int h = 0; h < 8; ++h) {
+            msh[h] = mrun[h];
+            ssh[h] = srun[h];
+        }
+    }
+    __syncthreads();
+    if (tid < R) {
+        pmax[(size_t) (kvh * R + tid) * nsplits + sp] = msh[tid];
+        psum[(size_t) (kvh * R + tid) * nsplits + sp] = ssh[tid];
+    }
+}
+
+/// Merge the fused splits: out = sum_s part_s * exp(max_s - M) / sum_s sum_s * exp(max_s - M).
+__global__ void k_attn_combine_f(const float* part, const float* pmax, const float* psum, float* out, int H, int D,
+                                 int nsplits, int qstride) {
+    const int h = blockIdx.x, d = threadIdx.x;
+    float m = -INFINITY;
+    for (int s = 0; s < nsplits; ++s) m = fmaxf(m, pmax[(size_t) h * nsplits + s]);
+    float acc = 0.f, sum = 0.f;
+    for (int s = 0; s < nsplits; ++s) {
+        const float w = __expf(pmax[(size_t) h * nsplits + s] - m);
+        acc += part[((size_t) h * nsplits + s) * D + d] * w;
+        sum += psum[(size_t) h * nsplits + s] * w;
+    }
+    out[(size_t) h * qstride + d] = sum > 0.f ? acc / sum : 0.f;
+}
+
 /// dst[e] = src[idx[e]] for `qb` bytes (one q8_1 column per entry), for the grouped-expert path.
 __global__ void k_gather_cols(uint8_t* __restrict__ dst, const uint8_t* __restrict__ src,
                               const int* __restrict__ idx, int qb) {
@@ -1278,6 +1457,12 @@ struct Engine {
     // activations [tmax][...]
     float *x, *h, *y, *qkf, *vx, *att, *router, *gu, *eh, *ey, *sg, *su, *shh, *sy, *wts, *logits;
     float *att_sc = nullptr, *att_part = nullptr;   // GEMM attention: scores [H][ctx], split accumulators [H][S][D]
+    float *att_pmax = nullptr, *att_psum = nullptr; // the fused path's per-split (max, sum), [H][S]
+    // The fused flash-decoding kernel (k_attn_flash_dec) is correct - identical token ids over 24 decode steps, and
+    // a CPU reference agrees to 0.02% - but slower: 32.7 ms/token against 24.9 at 9,961 positions.  Its 51 KiB of
+    // shared memory leaves 4 blocks an SM, and its 128 threads have to do the scores and the V accumulation in turn,
+    // where the four kernels get 256 threads for the scores and 8 KiB a block for the values.  Off by default.
+    bool att_fused = false;   // STRATA_GLM4_ATTN_FUSED=1: the fused flash-decoding pass instead of the four kernels
     int att_splits = 32;   // STRATA_GLM4_ATTN_SPLITS: position splits for the value accumulation
     bool att_gemm = false;   // force the GEMM path
     int att_thresh = 640;    // ... or use it once the context passes this many positions (STRATA_GLM4_ATTN=fast disables)
@@ -1511,6 +1696,8 @@ struct Engine {
         if (const char* v = std::getenv("STRATA_GLM4_ATTN_SKIP")) attn_skip = std::atoi(v);
         att_flash = std::getenv("STRATA_GLM4_NO_ATTN_FLASH") == nullptr;
         att_tc = std::getenv("STRATA_GLM4_ATTN_TC") == nullptr || std::atoi(std::getenv("STRATA_GLM4_ATTN_TC")) != 0;
+        att_fused = std::getenv("STRATA_GLM4_ATTN_FUSED") != nullptr &&
+                    std::atoi(std::getenv("STRATA_GLM4_ATTN_FUSED")) != 0;
         // STRATA_GLM4_KV_INT8: the cache holds one int8 per value plus a per-(head, position) scale, so it takes
         // half the VRAM and the expert cache grows.  Only the GEMM decode and flash prompt kernels carry it, so the
         // decode threshold is dropped to 0 and the flash path is forced (the older kernels stay half-only).
@@ -1632,6 +1819,8 @@ struct Engine {
         att_nsplits = std::max(1, std::min(att_splits, att_tiles * 2));
         if (att_nsplits > att_splits) att_nsplits = att_splits;
         att_part = dalloc((size_t) g.n_head * (size_t) att_splits * (size_t) g.head_dim);
+        att_pmax = dalloc((size_t) g.n_head * (size_t) att_splits);
+        att_psum = dalloc((size_t) g.n_head * (size_t) att_splits);
 
         d_cols = dalloc_t<int32_t>(T * Kp);
         d_rows = dalloc_t<int32_t>(T * Kp);
@@ -2070,7 +2259,27 @@ struct Engine {
                 // GEMM-style decode attention: K / V are read once for the 8 heads that share a KV head
                 const int tiles = att_tiles, nsplits = att_nsplits;
                 const float scale = 1.0f / sqrtf((float) D);
+                const int n_tiles_now = (int) ((pos_stage + 1 + 127) / 128);   // for the 4-kernel path only
+                const int fsplit = nsplits;
                 if (pf) CK(cudaEventRecord(ea[0], st));
+                if (l == 0 && std::getenv("STRATA_GLM4_ATTN_DBG"))
+                    std::fprintf(stderr, "fused dbg: n=%lld pos_stage=%lld n_tiles=%d fsplit=%d nsplits=%d\n",
+                                 (long long) n, (long long) pos_stage, n_tiles_now, fsplit, nsplits);
+                if (att_fused) {
+                    // one pass: K and V read once each, no score matrix (flash-decoding)
+                    if (kv_i8)
+                        k_attn_flash_dec<int8_t><<<dim3(HKV, fsplit), 128, 0, st>>>(
+                            qkf, (const int8_t*) kc[(size_t) l], (const int8_t*) vc[(size_t) l], ksc[(size_t) l],
+                            vsc[(size_t) l], att_part, att_pmax, att_psum, H, HKV, D, ctx, d_pos, scale, fsplit,
+                            n_tiles_now);
+                    else
+                        k_attn_flash_dec<__half><<<dim3(HKV, fsplit), 128, 0, st>>>(
+                            qkf, (const __half*) kc[(size_t) l], (const __half*) vc[(size_t) l], nullptr, nullptr,
+                            att_part, att_pmax, att_psum, H, HKV, D, ctx, d_pos, scale, fsplit, n_tiles_now);
+                    if (pf) CK(cudaEventRecord(ea[1], st));
+                    k_attn_combine_f<<<H, D, 0, st>>>(att_part, att_pmax, att_psum, att, H, D, fsplit, D);
+                    if (pf) CK(cudaEventRecord(ea[4], st));
+                } else {
                 if (att_tc && H / HKV <= 16 && D == 128) {
                     if (kv_i8)
                         k_attn_scores_tc<int8_t><<<dim3(HKV, tiles), 256, 0, st>>>(
@@ -2098,6 +2307,7 @@ struct Engine {
                 if (pf) CK(cudaEventRecord(ea[3], st));
                 k_attn_combine<<<H, 128, 0, st>>>(att_part, att, H, D, nsplits, D);
                 if (pf) CK(cudaEventRecord(ea[4], st));
+                }
             } else if (D == 128)
                 if (att_flash && n > 1 && H / HKV == 8 && D == 128) {
                     if (kv_i8)
@@ -2127,8 +2337,9 @@ struct Engine {
                 CK(cudaStreamSynchronize(st));
                 double s = 0;
                 for (float v : h) s += v;
-                std::fprintf(stderr, "attn dump pos=%lld: sum %.6f first %.6f %.6f %.6f\n", (long long) pos0, s, h[0],
-                             h[1], h[2]);
+                std::fprintf(stderr, "attn dump pos=%lld: sum %.6f first %.6f %.6f %.6f | h1 %.6f %.6f | h8 %.6f\n",
+                             (long long) pos0, s, h[0], h[1], h[2], h[(size_t) D], h[(size_t) D + 1],
+                             h[(size_t) 8 * D]);
             }
             if (pf) CK(cudaEventRecord(ea[14], st));
             mm(L.wo, att, y, n);

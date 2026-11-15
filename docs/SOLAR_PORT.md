@@ -1234,11 +1234,11 @@ What the numbers mean:
 
 | decode, 120 tokens | ms/token | tok/s |
 |---|---|---|
-| 1,141-token context | 21.5 | 46.5 |
-| 9,961-token context | 26.3 | 38.1 |
+| 1,141-token context | 20.4 | 49.0 |
+| 9,961-token context | 24.9 | 40.1 |
 | 19,831-token context | 33.2 | 30.1 |
 | routed experts (bench, both projections) | 5 - 7 | `iq_mmvq_ptrs`, 8 experts a layer |
-| attention, marginal | 0.6 per 1,000 tokens | ~6 ms at 10K, ~12 ms at 19.6K |
+| attention, marginal | 0.5 per 1,000 tokens | ~5 ms at 10K, ~10 ms at 19.6K |
 
 Two caveats that apply to every other decode number in this file:
 
@@ -1335,6 +1335,28 @@ the first attempt died on `misaligned address`.
 
 Measured against the build from before both attention changes of this session, at 1,141 / 9,961 / 19,831 positions:
 22.1 -> 21.5, 32.2 -> 26.3, 47.9 -> 33.2 ms/token (-3%, -18%, -31%).
+
+### The four attention kernels fused: correct, and slower (`STRATA_GLM4_ATTN_FUSED=1`)
+
+The four kernels pay for a 64 x ctx fp32 score matrix - 2.6 MB at 10K, written once and read back three times - on
+top of the 10.5 MB of K and 10.5 MB of V.  `k_attn_flash_dec` removes it: one block per (KV head, tile split),
+128 threads = the D dims; each 128-position tile is staged, scored on the tensor cores into shared memory, folded
+into an online softmax (running max and sum per head, the accumulator rescaled when the max grows) and multiplied by
+V; `k_attn_combine_f` merges the per-split (max, sum, weighted V).
+
+It is right: 24 decode steps give identical token ids, and a standalone CPU reference over 9,962 positions agrees to
+0.02% (max |err| / max |ref|) at 1, 8 and 32 splits.
+
+It is also **31% slower**: 32.7 ms/token against 24.9 at 9,961 positions.  The block needs 51 KiB of shared memory
+(K tile 34.8, score tiles 8, q 4), which leaves 4 blocks an SM, and its 128 threads have to run the scores and the V
+accumulation in turn, where `k_attn_scores_tc` gets 256 threads and `k_attn_values` needs only 8 KiB a block.  Making
+the fusion pay needs 256 threads (two per dim, each half the positions) and a smaller tile - a larger change than
+this pass.  The kernel stays in the tree behind the flag with this result recorded.
+
+Two things it taught, both now in the code: the score tile's stride must be a multiple of 16 halves (136, not 130) or
+`ldmatrix` traps on `misaligned address`, and the split ranges must be derived from the *device* position, because a
+captured CUDA graph freezes the launch arguments (a host-side tile count stopped attending to positions added after
+capture - the first version produced a plausible-looking loop of repeated tokens that way).
 
 ## Architectures and backends
 
