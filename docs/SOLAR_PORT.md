@@ -1253,36 +1253,39 @@ Two caveats that apply to every other decode number in this file:
 
 The profiler used to sum a prefill chunk's buckets (3 s each) and then divide by the *decode* token count, which is
 why the totals here used to read ~530 ms/token.  It now accumulates decode forwards only (`n == 1`), and the buckets
-add up to what the engine reports:
+add up to what the engine reports.  The attention phase carries eight sub-probes:
 
 | bucket | ms/token | share | of which |
 |---|---|---|---|
-| attn | 14.01 | 39% | scores 2.68, values 2.73, softmax 0.98, combine 0.22, **q/k/v/o projections ~7.4** |
-| gate/up | 13.58 | 37% | k_fetch 7.20 (see the caveat), k_resolve 0.73, the matvec ~5.7 |
-| down | 3.05 | 8% | |
-| shared (expert) | 2.02 | 6% | |
-| router | 1.82 | 5% | rms 0.70, gemv 0.47, top-k 0.54 |
+| attn | 14.62 | 41% | scores 2.76, values 2.77, softmax 0.98, combine 0.20, **rms (pre) 2.39**, q/k/v 2.46, qk_prep 0.34, o proj 2.13 |
+| gate/up | 12.53 | 36% | k_fetch (see the caveat), k_resolve 0.73, the matvec ~5.5 |
+| down | 3.04 | 9% | |
+| shared (expert) | 2.00 | 6% | |
+| router | 1.77 | 5% | rms 0.73, gemv 0.42, top-k 0.53 |
 | head | 1.36 | 4% | |
 | embed | 0.08 | 0% | |
-| **total** | **36.25** | | against 26.3 with the graph: ~10 ms of launch gaps are what the graph covers |
+| **total** | **35.44** | | against 26.3 with the graph: ~9 ms of launch gaps are what the graph covers |
 
 The `k_fetch` span is not the copy's duration - it brackets the launch of a kernel on the same stream, and the
 misses it reports (132.6 blobs, 799 MB a token) would be 27 GB/s if spread over the whole step, i.e. at the link's
 limit.  The reliable number is the `NOFETCH` ablation: the fill costs ~4.7 ms of wall time and the rest of the step
 hides it.
 
-So the "25 ms that no matvec accounts for" does not exist: ~11 ms of it was launch gaps (hidden by the graph) and
+So the "25 ms that no matvec accounts for" does not exist: ~9-11 ms of it was launch gaps (hidden by the graph) and
 the rest was the division bug.  What is really left at 10K, in the graphed 26.3 ms:
 
-- attention kernels **6.6 ms** - scores 2.68 (tensor cores), values 2.73, softmax 0.98, combine 0.22
-- dense projections, shared expert and head **10.8 ms**
-- routed expert matvecs **8.7 ms** (376 + 300 GB/s in the bench: near the card's floor)
-- router, norms, sampling **1.9 ms**
+- the four attention kernels **6.7 ms** - scores 2.76 (tensor cores), values 2.77, softmax 0.98, combine 0.20
+- the dense projections **4.6 ms** (q/k/v 2.46, o proj 2.13) - and the bench says the two big matrices stream at
+  366-372 GB/s on their own (`tools/glm4/expert_paths_bench.cu`, 4096x8192 IQ2_S 28.9 us, 8192x4096 IQ3_S 39.4 us),
+  so this is the card's rate and not a kernel problem: at most ~1 ms is left here
+- routed expert matvecs **8.1 ms** (gate/up ~5.5, down 3.0), 376 + 300 GB/s: at the floor
+- **rms (pre) 2.39 ms** - one RMS norm over 4096 values, one block, 50 us a layer, against 15 us the *same* kernel
+  takes after attention.  Unexplained, and the one item here that is clearly not at any hardware limit
+- router, shared expert, head, qk_prep **5.5 ms**
 
-The largest single item is now the **q/k/v/o dense projections (~7.4 ms)**: one-column matvecs that the bench
-measures at 123-175 GB/s against 300+ for the same weights with eight columns, so a GEMV kernel with more
-independent work per weight byte is the next lever.  After that, `k_attn_values` (2.73 ms at 185 GB/s of V) and the
-scores' int8 staging.
+The next real lever is fusing the four attention kernels into a flash-decoding pass (K and V read once, no 2.6 MB
+score matrix written and read back three times): 6.7 -> ~3.5 ms, and the `values` kernel is already shaped as a
+per-split accumulate with a combine, which is the structure that fusion needs.
 
 ### The decode attention kernels: 16-byte cache reads (bit-exact, `STRATA_GLM4_ATTN=fast` path unchanged)
 

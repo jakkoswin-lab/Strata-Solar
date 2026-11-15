@@ -304,5 +304,34 @@ int main() {
             std::printf("        gate|up row 0: max|y| %.4g, max rel diff %.3g, %d/%d nonzero\n", mxv, worst, nzd, GU);
         }
     }
+    // ---- decode: the dense projections at the model's real shapes (one row, the same weights every token)
+    {
+        struct Dense { int ty; int n_in, n_out; const char* name; };
+        const Dense D[] = {{22, 4096, 8192, "attn_q  IQ2_S"}, {21, 8192, 4096, "attn_o  IQ3_S"}};
+        const int ND = 4;   // copies cycled so the weights are not L2-resident (one matrix is ~11-15 MB)
+        std::printf("\ndecode dense projections, one row, %d copies cycled\n", ND);
+        for (const Dense& d : D) {
+            const size_t wb = strata::kernels::iq_row_bytes(d.ty, d.n_in) * (size_t) d.n_out;
+            std::vector<uint8_t*> w((size_t) ND);
+            for (int i = 0; i < ND; ++i) {
+                CK(cudaMalloc(&w[(size_t) i], wb));
+                CK(cudaMemset(w[(size_t) i], 1, wb));
+            }
+            strata::kernels::quantize_q8_1_rows(x, 1, d.n_in, q8, nullptr);
+            float* out = yd;
+            auto run = [&]() {
+                for (int i = 0; i < ND; ++i) strata::kernels::iq_mmvq(d.ty, w[(size_t) i], q8, out, d.n_in, d.n_out, 1, nullptr);
+            };
+            for (int i = 0; i < 3; ++i) run();
+            CK(cudaDeviceSynchronize());
+            const auto t0 = Clock::now();
+            for (int r = 0; r < reps; ++r) run();
+            CK(cudaDeviceSynchronize());
+            const double us = std::chrono::duration<double, std::micro>(Clock::now() - t0).count() / (reps * ND);
+            std::printf("  %s  %5d x %5d  %.1f MB: %8.1f us  %5.0f GB/s\n", d.name, d.n_in, d.n_out,
+                        (double) wb / 1e6, us, (double) wb / (us * 1e3));
+            for (int i = 0; i < ND; ++i) CK(cudaFree(w[(size_t) i]));
+        }
+    }
     return 0;
 }

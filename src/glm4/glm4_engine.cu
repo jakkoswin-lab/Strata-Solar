@@ -1354,7 +1354,7 @@ struct Engine {
     std::vector<cudaEvent_t> pev_a;   // 4 pairs per layer: scores / softmax / values / combine
     std::vector<cudaEvent_t> pev_g;   // 3 pairs per layer: rms / router gemv / route top-k
     double prof_fetch_ms = 0, prof_fetch_bytes = 0, prof_resolve_ms = 0;
-    double prof_attn_k[4] = {};
+    double prof_attn_k[8] = {};
     double prof_route_k[3] = {};
     long long prof_tokens = 0, prof_misses0 = 0;
     bool prof_started = false;
@@ -1389,8 +1389,9 @@ struct Engine {
                 for (int j = 0; j < 3; ++j)
                     std::fprintf(stderr, "strata-glm4: profile     router %-8s %5.2f ms/token (%5.1f us/layer)\n", rn[j],
                                  prof_route_k[j] / n, prof_route_k[j] / n / (double) m->layers.size() * 1000.0);
-                static const char* const an[4] = {"scores", "softmax", "values", "combine"};
-                for (int j = 0; j < 4; ++j)
+                static const char* const an[8] = {"scores", "softmax", "values", "combine", "rms(pre)",
+                                                  "q/k/v", "qk_prep", "o proj"};
+                for (int j = 0; j < 8; ++j)
                     std::fprintf(stderr, "strata-glm4: profile     attn %-8s %6.2f ms/token (%6.1f us/layer)\n", an[j],
                                  prof_attn_k[j] / n,
                                  prof_attn_k[j] / n / (double) m->layers.size() * 1000.0);
@@ -1551,7 +1552,7 @@ struct Engine {
             pev_r.resize(2 * m->layers.size());
             for (cudaEvent_t& e : pev_r) CK(cudaEventCreate(&e));
             for (cudaEvent_t& e : pev_r) CK(cudaEventRecord(e, st));
-            pev_a.resize(8 * m->layers.size());
+            pev_a.resize(16 * m->layers.size());
             for (cudaEvent_t& e : pev_a) CK(cudaEventCreate(&e));
             for (cudaEvent_t& e : pev_a) CK(cudaEventRecord(e, st));   // the serial attention path leaves them alone
             pev_g.resize(6 * m->layers.size());
@@ -2033,7 +2034,11 @@ struct Engine {
             if (dbg) std::fprintf(stderr, "glm4: layer %lld attn\n", (long long) l);
             dpx_layer = l;
             const Layer& L = m->layers[(size_t) l];
+            cudaEvent_t* ea = pf ? &pev_a[(size_t) (16 * l)] : nullptr;
+            if (pf) CK(cudaEventRecord(ea[8], st));
             k_rms_rows<<<n, kThreads, 0, st>>>(x, L.attn_norm, h, N, m->eps);
+            if (pf) CK(cudaEventRecord(ea[9], st));
+            if (pf) CK(cudaEventRecord(ea[10], st));
             dump_t("norm", h, (size_t) n * N);
             if (L.qk_merged) {
                 mm(L.qk, h, qkf, n);   // q and k in one launch: the packed matrix is (H + HKV) * D rows
@@ -2049,6 +2054,8 @@ struct Engine {
             }
             dump_t("qkr", qkf, (size_t) n * (H + HKV) * D);
             mm(L.wv, h, vx, n);
+            if (pf) CK(cudaEventRecord(ea[11], st));
+            if (pf) CK(cudaEventRecord(ea[12], st));
             if (kv_i8)
                 k_qk_prep_rows<int8_t><<<(unsigned) (n * (H + HKV)), kThreads, 0, st>>>(
                     qkf, vx, (int8_t*) kc[(size_t) l], (int8_t*) vc[(size_t) l], ksc[(size_t) l], vsc[(size_t) l],
@@ -2058,11 +2065,11 @@ struct Engine {
                     qkf, vx, (__half*) kc[(size_t) l], (__half*) vc[(size_t) l], nullptr, nullptr,
                     H, HKV, D, m->n_rot, d_pos, ctx, m->rope_base);
             dump_t("qk", qkf, (size_t) n * (H + HKV) * D);
+            if (pf) CK(cudaEventRecord(ea[13], st));
             if ((force_gemm || att_gemm || pos0 + 1 >= att_thresh) && n == 1 && D == 128 && HKV > 0 && H / HKV == 8) {
                 // GEMM-style decode attention: K / V are read once for the 8 heads that share a KV head
                 const int tiles = att_tiles, nsplits = att_nsplits;
                 const float scale = 1.0f / sqrtf((float) D);
-                cudaEvent_t* ea = pf ? &pev_a[(size_t) (8 * l)] : nullptr;
                 if (pf) CK(cudaEventRecord(ea[0], st));
                 if (att_tc && H / HKV <= 16 && D == 128) {
                     if (kv_i8)
@@ -2123,7 +2130,9 @@ struct Engine {
                 std::fprintf(stderr, "attn dump pos=%lld: sum %.6f first %.6f %.6f %.6f\n", (long long) pos0, s, h[0],
                              h[1], h[2]);
             }
+            if (pf) CK(cudaEventRecord(ea[14], st));
             mm(L.wo, att, y, n);
+            if (pf) CK(cudaEventRecord(ea[15], st));
             dump_t("attn", att, (size_t) n * H * D);
             dump_t("wo", y, (size_t) n * N);
             k_add_rows<<<(unsigned) ((n * N + 255) / 256), 256, 0, st>>>(x, y, n * N);
@@ -2488,14 +2497,15 @@ struct Engine {
                     CK(cudaEventElapsedTime(&ms, pev_g[6 * k + j], pev_g[6 * k + j + 1]));
                     prof_route_k[j] += ms;
                 }
-            for (size_t k = 0; k < (size_t) m->layers.size(); ++k) {
-                static const int step[4] = {0, 1, 2, 3};
-                for (int j = 0; j < 4; ++j) {
+            // the four attention phases read consecutive events (the first records before the scores, the last
+            // after the combine); the four added pairs start at 8 and step by 2
+            static const int astart[8] = {0, 1, 2, 3, 8, 10, 12, 14};
+            for (size_t k = 0; k < (size_t) m->layers.size(); ++k)
+                for (int j = 0; j < 8; ++j) {
                     float ms = 0;
-                    CK(cudaEventElapsedTime(&ms, pev_a[8 * k + step[j]], pev_a[8 * k + step[j] + 1]));
+                    CK(cudaEventElapsedTime(&ms, pev_a[16 * k + astart[j]], pev_a[16 * k + astart[j] + 1]));
                     prof_attn_k[j] += ms;
                 }
-            }
             double sum = 0;
             for (int k = 1; k < pei; ++k) {
                 float ms = 0;
