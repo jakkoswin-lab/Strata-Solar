@@ -492,7 +492,10 @@ class TablesMatchTheSources(unittest.TestCase):
         cpp = set(re.findall(r'add\("([^"]+)"', text)) | set(re.findall(r'push_back\(\{"([^"]+)"', text))
         py = set()
         g4, g35 = Q.Geometry(), Q.Geometry(family="qwen35moe", hc=0, hc_lr=0, idx_q_heads=0, idx_key_dim=0, n_mtp_layers=1, n_layers=40)
-        for g in (g4, g35):
+        g4m = Q.Geometry(family="glm4moe", hc=0, hc_lr=0, idx_q_heads=0, idx_key_dim=0, n_embd=4096, n_head=64,
+                         n_head_kv=8, head_dim=128, n_expert=128, n_expert_used=8, n_ff=1280, n_ff_shexp=1280,
+                         n_expert_shared=1)
+        for g in (g4, g35, g4m):
             for l in range(g.n_layers + g.n_mtp_layers):
                 py |= {n for n, _ in Q.layer_tensors(g, l)}
             py |= {n for n, _ in Q.global_tensors(g)}

@@ -81,6 +81,8 @@ class Geometry:
     n_ff_shexp: int = 640
     family: str = "qwen4exp"
     n_mtp_layers: int = 0
+    n_expert_shared: int = 0        # expert_shared_count (glm4moe: 1)
+    n_layer_dense_lead: int = 0     # leading_dense_block_count (glm4moe: 0)
 
     @property
     def has_indexer(self) -> bool:
@@ -106,11 +108,12 @@ class Geometry:
 COMPILED = Geometry()
 
 # include/strata/artifact/model_family.hpp
-FAMILY_ARCH = {"qwen4exp": "qwen4exp", "qwen35moe": "qwen35moe"}
-FAMILY_TITLE = {"qwen4exp": "Qwen3.8-Flash-Next", "qwen35moe": "Qwen3.6-35B-A3B"}
+FAMILY_ARCH = {"qwen4exp": "qwen4exp", "qwen35moe": "qwen35moe", "glm4moe": "glm4moe"}
+FAMILY_TITLE = {"qwen4exp": "Qwen3.8-Flash-Next", "qwen35moe": "Qwen3.6-35B-A3B", "glm4moe": "Solar-Open-100B"}
 # model_family_runs() is true for qwen4exp only; qwen35moe has the src/qwen35 path the CUDA and HIP builds switch to.  The SYCL
 # build refuses it (model_family_not_supported); Metal has no such path (docs: "Metal and Intel Arc have no such path").
-FAMILY_BACKENDS = {"qwen4exp": ["cuda", "hip", "sycl", "metal"], "qwen35moe": ["cuda", "hip"]}
+FAMILY_BACKENDS = {"qwen4exp": ["cuda", "hip", "sycl", "metal"], "qwen35moe": ["cuda", "hip"],
+                   "glm4moe": ["cuda", "hip"]}   # src/glm4: the engine path this fork ships
 # Other architectures Strata runs with an engine of its own: never a Qwen4 path.
 OTHER_ENGINES = {"deepseek41": "strata-dsv41 (setup.py MULTI_FILE_FAMILIES): a separate engine, not the Qwen3.8 / Qwen3.6 paths"}
 
@@ -301,6 +304,15 @@ def qwen35_limit_violations(g: Geometry, arch: str) -> list[dict]:
 def layer_tensors(g: Geometry, layer: int) -> list[tuple[str, list[int]]]:
     kind = g.kind(layer)
     N, NE, FF, FS = g.n_embd, g.n_expert, g.n_ff, g.n_ff_shexp
+    if g.family == "glm4moe":
+        # Solar-Open-100B: pre-norm residual, plain GQA (no output gate, no QK norm, no GDN/QSA/indexer/hc), sigmoid
+        # routed experts plus one always-on shared expert whose gate is not a tensor, and a router bias.
+        return [("attn_norm.weight", [N]), ("post_attention_norm.weight", [N]),
+                ("attn_q.weight", [N, g.n_head * g.head_dim]), ("attn_k.weight", [N, g.n_head_kv * g.head_dim]),
+                ("attn_v.weight", [N, g.n_head_kv * g.head_dim]), ("attn_output.weight", [g.n_head * g.head_dim, N]),
+                ("ffn_gate_inp.weight", [N, NE]), ("exp_probs_b.bias", [NE]),
+                ("ffn_gate_shexp.weight", [N, FS]), ("ffn_up_shexp.weight", [N, FS]), ("ffn_down_shexp.weight", [FS, N]),
+                ("ffn_gate_exps.weight", [N, FF, NE]), ("ffn_up_exps.weight", [N, FF, NE]), ("ffn_down_exps.weight", [FF, N, NE])]
     t = [("ffn_gate_inp.weight", [N, NE]), ("ffn_gate_inp_shexp.weight", [N]), ("ffn_gate_shexp.weight", [N, FS]),
          ("ffn_up_shexp.weight", [N, FS]), ("ffn_down_shexp.weight", [FS, N]), ("ffn_gate_exps.weight", [N, FF, NE]),
          ("ffn_up_exps.weight", [N, FF, NE]), ("ffn_down_exps.weight", [FF, N, NE])]
@@ -375,7 +387,7 @@ BACKEND_LISTS = {
     # build compiles this same file: AMD gfx11 / gfx12 / gfx1151 differ in kernel modes and speed, not in this list.
     "cuda": {"gu": {16, 17, 18, 21, 22, 23, 29, 42, 12, 13, 14, 6, 2, 3, 8, 40, 144, 145, 147, 148, 149},
              "down": {20, 23, 42, 7, 6, 2, 3, 8, 13, 14, 40, 144, 146, 147, 148, 149},
-             "is_iq": {16, 17, 18, 20, 21, 22, 23, 29, 42, 11, 12, 13, 14, 7, 6, 2, 3, 8, 40, 144, 145, 146, 147, 148, 149},
+             "is_iq": {10, 16, 17, 18, 20, 21, 22, 23, 29, 42, 11, 12, 13, 14, 7, 6, 2, 3, 8, 40, 144, 145, 146, 147, 148, 149},
              "mmvq": MMVQ, "embed_extra": {30, 14}},
     # sycl/src/kernels/cuda/iq_kernels.dp.cpp (the SYCL port; it has no NVFP4 or the Gyro-L pair-trellis types)
     "sycl": {"gu": {16, 17, 18, 21, 22, 23, 29, 42, 12, 13, 14, 6, 2, 3, 8, 144, 145},
